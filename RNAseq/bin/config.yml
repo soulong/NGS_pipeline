@@ -1,0 +1,63 @@
+
+############################
+
+## alginment configuration ##
+# directory setup
+work_dir: .
+
+# start fastq files path(following the "work_dir")
+fastq_dir: rawdata
+
+# choose ecies(hs or mm)
+species: hs # (hs, mm)
+
+# choose sequencing mode(SE or PE)
+seq_type: PE # (PE, SE)
+read1_name: _1
+read2_name: _2
+
+# set library type
+lib_type: none # (none, forward, reverse)
+
+# fastq file gzip appendix
+fastq_suffix: .fq.gz # (.fastq.gz, .fq.gz, .fastq, .fq)
+
+# multiThread to use
+thread: 10
+
+# star-featurecounts
+output_bam: false # (true or false) 
+## alginment configuration ##
+
+
+## indicated output directory of each pipe software
+## don't modify it before you know it
+fastqc_dir: fastqc
+trim_dir: cleanfastq
+salmon_dir: salmon
+star_dir: bam
+featurecounts_dir: featurecounts
+output_dir: output
+multiqc_dir: multiqc
+
+############################
+
+
+
+
+############################
+## administator configration ##
+
+salmon_index_dir_hs: /index/salmon_index/GRCh38
+salmon_index_dir_mm: /index/salmon_index/GRCm38
+
+star_index_dir_hs: /index/star_index/GRCh38
+star_index_dir_mm: /index/star_index/GRCm38
+
+gtf_file_hs: /index/Homo_sapiens.GRCh38.95.gtf
+gtf_file_mm: /index/Mus_musculus.GRCm38.95.gtf
+
+## administator configration ##
+############################
+
+
