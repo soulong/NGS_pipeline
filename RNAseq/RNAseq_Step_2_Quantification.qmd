@@ -1,0 +1,243 @@
+---
+title: "RNAseq quantification"
+author: "Hao He"
+date: "`r Sys.time()`"
+editor_options:
+  chunk_output_type: console
+params:
+  # project directory
+  root_dir: "D:\\20260211_RNA_seq"
+  # hs or mm
+  species: "hs" 
+  # general setting
+  samplesheet: "samplesheet.csv" 
+  quantification_dir: "quantification"
+  salmon_dir: "result\\03_salmon"
+  bam_dir: "result\\04_bam"
+  bam_count_dir: "result\\05_featurecounts"
+  hs_gtf_file: "D:\\index\\hs\\v49\\gencode.v49.basic.annotation.gtf.gz"
+  mm_gtf_file: "D:\\index\\hs\\vM38\\gencode.vM38.basic.annotation.gtf.gz"
+---
+
+
+## Setup
+```{r setup, include=FALSE, cache=FALSE}
+# options("repos"=c(CRAN="http://mirrors.tuna.tsinghua.edu.cn/CRAN/"))
+# options(BioC_mirror="http://mirrors.tuna.tsinghua.edu.cn/bioconductor")
+script_path <- rstudioapi::getActiveDocumentContext()$path |> dirname()
+source(file.path(script_path, "RNAseq_helper.R"))
+
+# knitr::opts_knit$set(root.dir=dirname(f_path))
+setwd(params$root_dir)
+knitr::opts_chunk$set(echo=TRUE, results="hold", cache=TRUE)
+
+library(tidyverse)
+library(tximport)
+library(rio)
+options(rio.import.class='tbl')
+```
+
+## Get sample data 
+```{r}
+# load sample info
+sample <- import(params$samplesheet) %>% print()
+```
+
+## Get annotation
+```{r}
+gtf_file <- ifelse(params$species == "hs", params$hs_gtf_file, params$mm_gtf_file)
+
+# extract annotation data
+pharse_gtf <- function(gtf_file) {
+  gtf <- rtracklayer::import(gtf_file) %>%
+    as_tibble() %>%
+    filter(type %in% c("gene", "transcript")) %>%
+    select(type=type, 
+           gene_id, gene_name, 
+           # ENCODE use gene_type, ensembl use gene_biotype
+           matches("gene_(bio)?type"), 
+           transcript_id, transcript_name, 
+           matches("transcript_(bio)?type")) %>%
+    # remove version info
+    mutate(
+      gene_id=map_chr(
+        gene_id, \(x) str_split(x, "[.]", simplify=T)[1]),
+      transcript_id=map_chr(
+        transcript_id, \(x) str_split(x, "[.]", simplify=T)[1])) %>%
+    arrange(gene_id, transcript_id)
+  
+  return(gtf)
+}
+
+gtf <- pharse_gtf(gtf_file)
+
+# tidy gtf annotation
+t2g <- gtf %>% 
+  filter(type == "transcript") %>%
+  select(transcript_id, gene_id) %>%
+  distinct(transcript_id, .keep_all=TRUE)
+
+transcript_annotation <- gtf %>% 
+  filter(type == "transcript") %>%
+  select(ensembl_id=transcript_id, 
+         symbol=transcript_name, 
+         type=matches("transcript_(bio)?type")) %>%
+  distinct(ensembl_id, .keep_all=TRUE)
+
+gene_annotation <- gtf %>% 
+  filter(type == "gene") %>%
+  select(ensembl_id=gene_id, 
+         symbol=gene_name, 
+         type=matches("gene_(bio)?type")) %>%
+  distinct(ensembl_id, .keep_all=TRUE)
+```
+
+
+## Transcript quantification
+```{r transcript_level_quantification}
+if(dir.exists(params$salmon_dir)) {
+  
+  cat("\n------------------\n")
+  cat("read samlon files\n")
+  if(!dir.exists(params$quantification_dir))
+    dir.create(params$quantification_dir)
+  
+  salmon_dirs <- params$salmon_dir %>% 
+    list.dirs(recursive=F, full.names=F)
+  salmon_quant_files <- 
+    file.path(params$salmon_dir, salmon_dirs, "quant.sf") %>%
+    set_names(salmon_dirs)
+  
+  # check if equal
+  if(!setequal(names(salmon_quant_files), sample$sample))
+    stop("sample in sample_info are not identical with salmon oupput\n")
+  
+  # # set sample to sample_name in expression matrix
+  # names(salmon_quant_files) <- map_int(
+  #   names(salmon_quant_files), 
+  #   \(x) which(x==sample$sample_name)) %>%
+  #   sample$sample_name[.]
+  
+  # re-order sample according to sample info in excel
+  salmon_quant_files <- salmon_quant_files[sample$sample]
+  
+  # read salmon output
+  tx_salmon_transcript <- salmon_quant_files %>% 
+    tximport(type="salmon", txIn=T, txOut=T,
+             countsFromAbundance="no")
+  
+  # annotate transcript
+  cat("get trancript level expression\n")
+  transcript_counts_anno <- tx_salmon_transcript$counts %>% 
+    as_tibble(rownames="ensembl_id") %>%
+    mutate(ensembl_id=map_chr(
+      ensembl_id, \(x) str_split(x,"[.]", simplify=T)[1])) %>% 
+    right_join(transcript_annotation, ., 
+               by=join_by(ensembl_id)) %>%
+    mutate(across(where(is.numeric), \(x) round(x, 0)))
+  
+  transcript_tpm_anno <- tx_salmon_transcript$abundance %>% 
+    as_tibble(rownames="ensembl_id") %>%
+    mutate(ensembl_id=map_chr(
+      ensembl_id, \(x) str_split(x,"[.]", simplify=T)[1])) %>% 
+    right_join(transcript_annotation, ., 
+               by=join_by(ensembl_id)) %>%
+    mutate(across(where(is.numeric), \(x)round(x, 2)))
+  
+  # write annotated expression file
+  list(tpm=transcript_tpm_anno, 
+       counts=transcript_counts_anno) %>% 
+    export(file.path(params$quantification_dir, 
+                     str_c(Sys.Date(), "_transcript_expression.xlsx")))
+  
+} else {
+  cat("no salmon output directory found, skip evaluate it\n")
+}
+
+```
+
+
+## Gene quantification
+```{r gene_level_quantification}
+if(exists("tx_salmon_transcript")) {
+  
+  cat("summarize to gene level expression\n")
+  tx_salmon_gene <- tx_salmon_transcript %>% 
+    summarizeToGene(t2g, ignoreTxVersion=T, countsFromAbundance="no")
+  
+  # annotate gene
+  gene_counts_anno <- tx_salmon_gene$counts %>% 
+    as_tibble(rownames="ensembl_id") %>%
+    right_join(gene_annotation, ., by=join_by(ensembl_id)) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 0)))
+  
+  gene_tpm_anno <- tx_salmon_gene$abundance %>% 
+    as_tibble(rownames="ensembl_id") %>%
+    right_join(gene_annotation, ., by=join_by(ensembl_id)) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 2)))
+  
+  # write annotated expression file
+  list(tpm=gene_tpm_anno, 
+       counts=gene_counts_anno) %>% 
+    export(file.path(params$quantification_dir, 
+                     str_c(Sys.Date(), "_gene_expression.xlsx")))
+  
+  cat("------------------\n") 
+}
+```
+
+
+
+## BAM quantification
+```{r gene_quantification_from_bam}
+if(file.exists(params$bam_count_dir)) {
+  if(!(list.files(params$quantification_dir) %>%
+       str_detect("_gene_expression_bam.xlsx") %>% 
+       any())) {
+    
+    cat("\n------------------\n")
+    cat("\nfeaturcounts gene annoation\n")
+    gene_count_featurecounts <- import(paste0(
+      params$bam_count_dir, "/gene_counts.txt")) %>%
+      dplyr::select(!(Chr:Strand)) %>% 
+      # simplify colnames
+      rename_with(\(x) basename(x) %>% str_replace('(.bam)',''), !c(1:2)) %>% 
+      #re-order cols
+      select(ensembl_id=Geneid, Length, all_of(sample$sample)) %>% 
+      # simplify rownames
+      mutate(ensembl_id=str_replace_all(ensembl_id, '\\.\\d?', ''))
+    
+    # annotation
+    gene_count_featurecounts_anno <- gene_count_featurecounts %>% 
+      dplyr::select(!Length) %>%
+      right_join(gene_annotation, ., by=join_by(ensembl_id)) %>%
+      mutate(across(where(is.numeric), ~ round(.x, 0)))
+    
+    # calculate TPM values
+    tpm <- function(counts, lengths) {
+      rate <- counts / lengths
+      rate / sum(rate) * 1e6 }
+    
+    gene_tpm_featurecounts_anno <- gene_count_featurecounts %>%
+      pivot_longer(3:last_col(), names_to="sample", values_to="counts") %>%
+      mutate(tpm=tpm(counts, Length), counts=NULL, Length=NULL, .by=sample) %>%
+      pivot_wider(names_from="sample", values_from="tpm") %>%
+      # annotation
+      right_join(gene_annotation, ., by=join_by(ensembl_id)) %>%
+      mutate(across(where(is.numeric), ~ round(.x, 2)))
+    
+    # save file
+    list(tpm=gene_tpm_featurecounts_anno, 
+           counts=gene_count_featurecounts_anno) %>% 
+      export(file.path(params$quantification_dir,
+                       str_c(Sys.Date(),"_gene_expression_bam.xlsx")))
+    
+    cat("------------------\n")
+  }
+} else {
+  cat("skip featurecounts quantification\n")
+}
+```
+
+
+

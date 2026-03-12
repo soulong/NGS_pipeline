@@ -1,0 +1,518 @@
+---
+title: "RNAseq Differential Gene Expression Analysis"
+author: "Hao He"
+date: "`r Sys.time()`"
+editor_options:
+  chunk_output_type: console
+params:
+   # project directory
+  root_dir: "D:\\20260211_RNA_seq"
+  # hs or mm
+  species: "hs" 
+  # general setting
+  samplesheet: "samplesheet.csv" 
+  quantification_dir: "quantification"
+  counts_file_suffix: "_gene_expression.xlsx"
+  deseq2_dir: "deseq2"
+  deg_padj: 0.01
+  deg_fc: 1.5
+  deg_threshold: 2 # tpm threshold at least in one group for plot heatmmap
+---
+
+# Setup
+```{r setup, include=FALSE, cache = FALSE}
+# options("repos" = c(CRAN = "http://mirrors.tuna.tsinghua.edu.cn/CRAN/"))
+# options(BioC_mirror = "http://mirrors.tuna.tsinghua.edu.cn/bioconductor")
+script_path <- rstudioapi::getActiveDocumentContext()$path |> dirname()
+source(file.path(script_path, "RNAseq_helper.R"))
+
+# knitr::opts_knit$set(root.dir=dirname(f_path))
+setwd(params$root_dir)
+knitr::opts_chunk$set(echo=TRUE, results="hold", cache=TRUE)
+
+species <- params$species
+deg_padj <- params$deg_padj
+deg_fc <- params$deg_fc
+deg_threshold <- params$deg_threshold
+samplesheet <- params$samplesheet
+counts_file_suffix <- params$counts_file_suffix
+deseq2_dir <- params$deseq2_dir
+quantification_dir <- params$quantification_dir
+run_DEG_pattern <- params$run_DEG_pattern
+save_Rdata <- params$save_Rdata
+
+if(!dir.exists(deseq2_dir)) dir.create(deseq2_dir)
+
+library(tidyverse)
+library(DESeq2)
+library(ashr)
+library(corrplot)
+library(pheatmap)
+library(factoextra)
+library(patchwork)
+library(rio)
+options(rio.import.class='tbl')
+```
+
+# Prepare colData
+```{r}
+sample <- import(samplesheet)
+col_data <- sample[, 1:2] %>% column_to_rownames('sample') %>% print()
+
+# edit manually
+comparison <- list(c("3P51-3h", "DMSO"))
+
+if(!all(list_c(comparison) %in% sample$group)) 
+  stop('all comparison should be in group column!')
+
+```
+
+
+```{r}
+f <- 'quantification/2026-02-12_gene_expression.xlsx'
+x <- import(f, which='counts')
+
+ran <- rnorm(nrow(x), 1, sd=0.1)
+ran[ran < 0.2] <- 0.2
+x$`3P51-3h-2` <- x$`3P51-3h-1` * ran
+
+ran <- rnorm(nrow(x), 1, sd=0.1)
+ran[ran < 0.2] <- 0.2
+x$`DMSO-2` <- x$`DMSO-1` * ran
+
+y <- import(f, which='tpm')
+export(list(tpm=y, counts=x), f)
+```
+
+
+# Prepare count matrix
+```{r}
+# look for expr file
+expr_file <- list.files(quantification_dir, counts_file_suffix, full.names = T) %>% 
+  str_subset("^~", negate = T) # remove tmp file when file opened in windows
+# check expression file exist
+if(length(expr_file) == 0) {
+  stop(str_glue("can't find '{counts_file_suffix}'")) } else {
+    # check unique
+    if(length(expr_file) > 1) {
+      print(str_glue("more than one '{counts_file_suffix}', use last one"))
+      expr_file <- last(expr_file)
+      print(expr_file) } }
+
+# read counts
+print("read counts data")
+counts <- import(expr_file, which = "counts")
+# remove samples not include (include = no) and convert to matrix
+counts <- counts[, c("symbol", sample$sample)] %>% 
+  filter(!is.na(symbol)) %>%
+  distinct(symbol, .keep_all = T) %>%
+  column_to_rownames("symbol") %>% 
+  round()
+# filter low count genes within each group
+counts <- sample[, 1:2] %>% deframe %>% 
+  # mean > 10 counts at least one group
+  filter_df_by_group(counts, ., threshold = 5)
+
+# read TPM
+if("tpm" %in% readxl::excel_sheets(expr_file)) {
+  print("read TPM data")
+  tpm <- import(expr_file, which = "tpm") %>% 
+    select(all_of(c("symbol", sample$sample))) %>% 
+    filter(symbol %in% rownames(counts), !is.na(symbol)) %>% 
+    distinct(symbol, .keep_all = T)
+  # mean > xx tpm at least one group
+  tpm_filter <- tpm %>% 
+    filter_df_by_group(
+      deframe(sample[, 1:2]), 
+      threshold = deg_threshold)
+  }
+```
+
+# Cnnstruct DESeq2
+```{r}
+deseq_matrix <- DESeqDataSetFromMatrix(
+  counts, colData = col_data, design = ~ group)
+
+deseq_wald <- DESeq(deseq_matrix)
+```
+
+# Exploratory analysis
+```{r}
+# vst transformation
+vst <- vst(deseq_wald, blind = F)
+vst_mat <- assay(vst)
+
+# top N variable genes heatmap
+N <- 2000
+top_variable_genes <- rowVars(vst_mat) %>% 
+  order(decreasing = T) %>% .[1:N] %>% vst_mat[., ] %>% 
+  pheatmap::pheatmap(
+    scale = "row", border_color = NA,
+    col = colorRampPalette(c("#377eb8", "#f7f7f7", "#e41a1c"))(100),
+    # col = colorRampPalette(c("#377eb8", "#f7f7f7", "#e41a1c"))(100)
+    show_rownames = F, cluster_cols = F, cluster_rows = T,
+    annotation_col = col_data[, "group", drop = F], 
+    filename = str_glue("{deseq2_dir}/{Sys.Date()}_variable_genes_heatmap_top{N}.pdf"),
+    width = ceiling(nrow(col_data)/1), 
+    height = ceiling(nrow(col_data)/1),
+    main = str_glue("Heatmap of top {N} variable genes") )
+
+# sample to sample correlation
+vst_mat %>% 
+  cor(method = "pearson") %>% 
+  pheatmap::pheatmap(
+    scale = "none", border_color = NA,
+    cluster_cols = F, cluster_rows = F,
+    col = colorRampPalette(RColorBrewer::brewer.pal(9, "Blues"))(255),
+    annotation_col = col_data[, "group", drop = F], 
+    annotation_row = col_data[, "group", drop = F], 
+    filename = str_glue("{deseq2_dir}/{Sys.Date()}_sample_correlation.pdf"),
+    width = ceiling(nrow(col_data)*2), 
+    height = ceiling(nrow(col_data)*2) - 1,
+    main = str_glue("Sample distance using all expressed genes")
+  )
+
+
+# PCA
+pca <- t(vst_mat) %>% prcomp(scale. = T)
+# scree plot
+p1 <- fviz_eig(pca, addlabels = T) + 
+  labs(title=NULL) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+# individuals
+p2 <- pca %>% 
+  fviz_pca_ind(
+    axes = c(1, 2), 
+    geom = c("point", "text"), 
+    repel = TRUE, labelsize = 2, 
+    pointshape = 19, pointsize = 2, 
+    col.ind = sample$group,
+    # fill.ind = sample$contrasts,
+    addEllipses = TRUE, ellipse.type = "confidence", ellipse.level = 0.95, 
+    invisible = "quali", legend.title = "") +
+  labs(title=NULL) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.position = "top",
+        legend.key.size = unit(0.01, 'snpc'),
+        legend.text = element_text(size=4))
+ggsave(str_glue("{deseq2_dir}/{Sys.Date()}_sample_pca.pdf"), 
+       p1 + p2 + plot_layout(widths = c(3, 2)), 
+       width=9, height=4)
+```
+
+# Save normalized data
+```{r}
+expr_norm <- list(
+  counts_norm = counts(deseq_wald, normalize=T) %>% as_tibble(rownames="symbol"),
+  vst = vst_mat %>% as_tibble(rownames="symbol"),
+  tpm = tpm )
+
+export(expr_norm, str_glue(
+  "{quantification_dir}/{Sys.Date()}_norm_expression.xlsx"))
+```
+
+# Get comparison result
+```{r}
+# extract wald test result 
+if(length(comparison) > 0) {
+  deg_list <- list()
+  for (i in seq_along(comparison)) {
+    cat(str_c(">>>>>>>> get wald test result on: ", 
+              comparison[[i]][1], "_vs_", comparison[[i]][2]))
+    
+    # get result
+    deg_unshrink <- results(
+      deseq_wald, 
+      contrast = c("group", comparison[[i]][1], comparison[[i]][2]) )
+    # shrink LFC
+    deg_shrink <- lfcShrink(
+      deseq_wald, 
+      contrast = c("group", comparison[[i]][1], comparison[[i]][2]), 
+      svalue = T, type = "ashr", quiet = T)
+    summary(deg_shrink)
+    # merge stats, p values with deg_shrink result
+    result <- left_join(
+      as_tibble(deg_shrink, rownames="symbol"),
+      as_tibble(deg_unshrink, rownames="symbol") %>% 
+        dplyr::select(symbol, stat, pvalue, padj),
+      by = join_by(symbol)) %>% 
+      mutate(baseMean=round(baseMean),
+             log2FoldChange=round(log2FoldChange,3),
+             lfcSE=round(lfcSE,3),
+             stat=round(stat, 3) ) %>% 
+      relocate(stat, .before = svalue) %>% 
+      arrange(svalue, desc(abs(log2FoldChange)))
+    
+    # append to results list
+    result <- list(result) %>% 
+      set_names(str_glue("{comparison[[i]][1]}_vs_{comparison[[i]][2]}"))
+    deg_list <- append(deg_list, result)
+  }
+  
+  # save deg result
+  export(deg_list, str_glue("{deseq2_dir}/{Sys.Date()}_wald_result.xlsx"))
+}
+```
+
+# Vacalno plot
+```{r}
+deg_list %>% 
+  imap(\(x,y) plot_volcano(
+    x, 
+    fc_thred=deg_fc, padj_thred=deg_padj,
+    title=y, size=1, alpha=0.7,
+    xlim=c(-7.5, 7.5), ylim=c(0, 120)
+  )) %>% 
+  wrap_plots(nrow=1) %>% 
+  ggsave(str_glue("{deseq2_dir}/{Sys.Date()}_wald_volcano.pdf"), ., 
+         width=ceiling(length(deg_list)*5), height=4, limitsize = F) 
+```
+
+# DEG count
+```{r}
+if(T) {
+  print("use wald test result as DEGs")
+  deg_gene <- map(deg_list, \(x) filter(
+    x, abs(log2FoldChange) > log2(deg_fc),  padj < deg_padj) %>% 
+      pull(symbol) %>% 
+      # filter by tpm
+      {if(exists("tpm_filter")) {
+        intersect(., tpm_filter$symbol) } else .} )
+  deg_uni <- deg_gene %>% unlist() %>% unique()
+  
+  # upset plot
+  # require(UpSetR)
+  # require(ComplexHeatmap)
+  pdf(str_glue("{deseq2_dir}/{Sys.Date()}_deg_count.pdf"), 
+      width=16, height=5)
+  m <- ComplexHeatmap::make_comb_mat(deg_gene)
+  p <- ComplexHeatmap::UpSet(m, pt_size=grid::unit(2, "mm"), 
+        comb_order = order(ComplexHeatmap::comb_size(m), decreasing = T))
+  ComplexHeatmap::draw(p)
+  while(dev.cur() != 1) dev.off()
+  
+} else {
+  print("use LRT result as DEGs")
+  # LRT test
+  deseq_lrt <- DESeqDataSetFromMatrix(
+    counts, colData = col_data, design = ~ group) %>%
+    DESeq(test = 'LRT', reduced = ~ 1)
+  # get LRT result
+  lrt_result <- results(deseq_lrt) %>% 
+    as_tibble(rownames='symbol')
+  # save LRT
+  export(lrt_result,
+         str_glue("{deseq2_dir}/{Sys.Date()}_lrt_result.xlsx"))
+  
+  deg_uni <- lrt_result %>%
+    filter(abs(log2FoldChange) > log2(deg_fc),
+           padj < deg_padj) %>% 
+    pull(symbol) %>% 
+    unique() %>% 
+    # filter by tpm
+    {if(exists("tpm_filter")) {
+      intersect(., tpm_filter$symbols) } else .}
+}
+
+print(str_glue("Number of deg: {length(deg_uni)}"))
+```
+
+# DEG heatmap
+```{r}
+# prepare deg heatmap data
+if(exists("tpm")) {
+  print("deg heatmap use tpm")
+  dat <- tpm %>% 
+    filter(symbol %in% deg_uni) %>% 
+    column_to_rownames("symbol") %>% 
+    list() %>% set_names("tpm")
+} else {
+  print("deg heatmap use vst transformed counts")
+  dat <- vst_mat %>% 
+    as_tibble(rownames="symbol") %>% 
+    filter(symbol %in% deg_uni) %>% 
+    filter(!is.na(symbol)) %>% 
+    column_to_rownames("symbol")%>% 
+    list() %>% set_names("vst") }
+
+# gene cluster annotation
+# anno_row <- pattern$df %>% 
+#   mutate(genes=NULL, cluster=str_glue("C{cluster}"))
+anno_col <- sample[, 1:2] %>% column_to_rownames("sample")
+
+# save deg heatmap
+p <- dat[[1]] %>% 
+  pheatmap::pheatmap(
+    name = names(dat), scale = "row", border_color = NA,
+    col = colorRampPalette(c("#377eb8", "#f7f7f7", "#e41a1c"))(100),
+    cluster_rows = T, cluster_cols = F,
+    annotation_col = anno_col, # annotation_row = anno_row, 
+    show_rownames = F, show_colnames = T, angle_col = 45,
+    filename = str_glue("{deseq2_dir}/{Sys.Date()}_deg_heatmap.pdf"),
+    width = ceiling((nrow(col_data)-1)*2),
+    height = ceiling((nrow(col_data)-1)*2),
+    main = str_glue("DEG heatmap (N={nrow(dat[[1]])})") )
+# save heatmap data
+dat[[1]] %>% 
+  # .[p$tree_row$order, p$tree_col$order] %>% 
+  .[p$tree_row$order, ] %>% 
+  as_tibble(rownames="symbol") %>% 
+  list() %>% set_names(names(dat)) %>% 
+  export(str_glue("{deseq2_dir}/{Sys.Date()}_deg_heatmap.xlsx"))
+```
+
+
+# Plot individuals
+```{r, eval=F}
+genes_roi <- read_xlsx("uniprotkb_family_protein_kinase_superfa_2025_04_26.xlsx") %>% 
+  pull(`Gene Names`) %>% 
+  map_chr(\(x) str_split(x, " ", simplify=T) %>% .[1]) %>% 
+  str_sort()
+# genes_roi <- c("SRC","AXL","AMOTL2","MYC","CCN2","CCN1","FGFR1","FGFR2","YAP1",
+#                "FGFR3","FGFR3","PDGFRA","PDGFRB","EGFR","ERBB2","ERBB3","ERBB4")
+
+tpm <- read_excel("2025-03-12_norm_expression.xlsx", "tpm") %>% 
+  filter(symbol %in% genes_roi) %>% 
+  select(symbol, 
+         starts_with("H358_P"), starts_with("ARS_24H"), 
+         starts_with("ARS_48H"), starts_with("H358_R")) %>% 
+  pivot_longer(!symbol, names_to="sample", values_to="tpm") %>% 
+  separate_wider_delim(sample, delim="#", names=c("contrast", "rep"), cols_remove=F) %>% 
+  print()
+
+plot <- tpm %>% 
+  mutate(contrast=factor(contrast, c(
+    "H358_P","ARS_24H","ARS_48H","H358_R"))) %>% 
+  ggplot(aes(contrast, tpm)) +
+  geom_jitter(shape=21, color="transparent", width = 0.25) +
+  facet_wrap(~ symbol, scales = "free", ncol = 4) +
+  labs(x = "", y = "TPM") +
+  theme_bw(base_size = 8) +
+  theme(axis.text.x = element_text(angle=90, vjust = 0.5, hjust = 1), 
+        legend.position = "none")
+
+ggsave(str_glue("{Sys.Date()}_tpm_plot.pdf"), 
+          plot, 
+          height = 2*ceiling(length(unique(tpm$symbol))/4), 
+          width = 8, limitsize=F)
+```
+
+# two groups crossing plot
+```{r}
+pathway <- c("HALLMARK_MYC_TARGETS_V1", "HALLMARK_MYC_TARGETS_V2")
+msigdb <- msigdbr::msigdbr(
+    species = if_else(species=="hs", "Homo sapiens", "Mus musculus"))
+myc_target_genes <- list(
+    ## H
+    Hallmark = filter(msigdb, gs_cat == "H")
+    ## GO
+    # GOBP = filter(msigdb, gs_subcat == "GO:BP")
+    # GOMF = filter(msigdb, gs_subcat == "GO:MF"),
+    # GOCC = filter(msigdb, gs_subcat == "GO:CC"),
+    ## cannonical pathway
+    # KEGG = filter(msigdb, gs_subcat == "CP:KEGG"),
+    # PID = filter(msigdb, gs_subcat == "CP:PID"),
+    # BIOCARTA = filter(msigdb, gs_subcat == "CP:BIOCARTA"),
+    # WikiPathway = filter(msigdb, gs_subcat == "CP:WIKIPATHWAYS"),
+    # Reactome = filter(msigdb, gs_subcat == "CP:REACTOME")
+  ) %>% 
+    map(\(x) dplyr::select(x, gs_id=gs_exact_source, gs_name, gene_symbol) %>% 
+          mutate(gs_id=ifelse(gs_id=="", gs_name, gs_id))) %>% 
+  list_rbind() %>% 
+  filter(gs_id %in% pathway) %>% 
+  pull(gene_symbol) %>% 
+  intersect(deg_list[[1]]$symbol)
+
+
+compares <- deg_list[c("Kelly.200nM.4h_vs_Kelly.0nM.16h", "SHEP.200nM.4h_vs_SHEP.0nM.16h")]
+compare_names <- c("Kelly.200nM.4h", "SHEP.200nM.4h") # Kelly first, then SHEP
+
+compares <- deg_list[c("Kelly.200nM.16h_vs_Kelly.0nM.16h", "SHEP.200nM.16h_vs_SHEP.0nM.16h")]
+compare_names <- c("Kelly.200nM.16h", "SHEP.200nM.16h") # Kelly first, then SHEP
+
+compares <- deg_list[c("Kelly.40nM.4h_vs_Kelly.0nM.16h", "SHEP.40nM.4h_vs_SHEP.0nM.16h")]
+compare_names <- c("Kelly.40nM.4h", "SHEP.40nM.4h") # Kelly first, then SHEP
+
+compares <- deg_list[c("Kelly.40nM.16h_vs_Kelly.0nM.16h", "SHEP.40nM.16h_vs_SHEP.0nM.16h")]
+compare_names <- c("Kelly.40nM.16h", "SHEP.40nM.16h") # Kelly first, then SHEP
+
+
+limits <- c(-2, 2)
+compares %>% 
+  set_names(compare_names) %>% 
+  list_rbind(names_to="compare") %>% 
+  filter(symbol %in% myc_target_genes) %>%
+  mutate(geneset=ifelse(symbol %in% myc_target_genes, "MYC targets", NA)) %>% 
+  mutate(log2FoldChange=ifelse(log2FoldChange > limits[2], limits[2], 
+                        ifelse(log2FoldChange < limits[1], limits[1], log2FoldChange))) %>% 
+  pivot_wider(id_cols=c(symbol, geneset), 
+              names_from=c(compare), 
+              values_from=log2FoldChange) %>% 
+  ggplot(aes(!!as.name(compare_names[1]), !!as.name(compare_names[2]))) +
+  # geom_point(aes(color=geneset), color="grey80") +
+  geom_point(color="red3") +
+  geom_hline(yintercept=c(-0.1, 0.1), linetype=2, color="grey20") +
+  geom_vline(xintercept=c(-0.1, 0.1), linetype=2, color="grey20") +
+  coord_cartesian(xlim=c(limits[1], limits[2]), ylim=c(limits[1], limits[2])) +
+  labs(x=str_glue("Log2FC of {compare_names[1]} to DMSO"),
+       y=str_glue("Log2FC of {compare_names[2]} to DMSO")) +
+  theme_bw()
+ggsave2(str_glue("{Sys.Date()}_compare_myc_targets_between_celltype_crossing_lfc.pdf"),
+        width=5, height=5)
+
+
+compares %>% 
+  set_names(compare_names) %>% 
+  list_rbind(names_to="compare") %>% 
+  # filter(log2FoldChange > 0) %>%
+  mutate(dir=ifelse(log2FoldChange>0, "up", "down")) %>% 
+  mutate(geneset=ifelse(symbol %in% myc_target_genes, "MYC targets", NA)) %>% 
+  filter(!is.na(geneset)) %>% 
+  ggplot(aes(compare, log2FoldChange, color=compare, size=-log10(padj))) +
+  ggbeeswarm::geom_quasirandom(show.legend=T) +
+  scale_size_continuous(range=c(0.5, 2)) +
+  ggpubr::stat_compare_means(comparisons=list(c(compare_names[1], compare_names[2])),
+                             method="wilcox.test") +
+  facet_wrap(~ dir, scales="free") +
+  scale_x_discrete(limits = rev) +
+  labs(y="log2FoldChange of HALLMARK_MYC_TARGETS") +
+  # geom_boxplot(outliers=F) +
+  theme_bw()
+ggsave2(str_glue("{Sys.Date()}_compare_myc_targets_between_celltype_scatter_lfc.pdf"),
+        width=6, height=4)
+
+limits <- c(-200, 200)
+expr_norm$tpm %>% 
+  filter(symbol %in% myc_target_genes) %>% 
+  # transmute(symbol=symbol, 
+  #           `Kelly.200nM.4h`=Kelly.200nM.4h - Kelly.0nM.16h, 
+  #           `SHEP.200nM.4h`=SHEP.200nM.4h - SHEP.0nM.16h)
+  pivot_longer(!symbol, names_to="sample_name") %>% 
+  left_join(sample) %>% 
+  filter(contrast %in% c(compare_names, "Kelly.0nM.16h", "SHEP.0nM.16h")) %>% 
+  reframe(value=mean(value), .by=c(contrast, cell, symbol)) %>% 
+  pivot_wider(id_cols=c(symbol), names_from=contrast, values_from=value) %>% 
+  transmute(symbol=symbol,
+            !!compare_names[1] := !!as.name(compare_names[1]) - Kelly.0nM.16h,
+            !!compare_names[2] := !!as.name(compare_names[2]) - SHEP.0nM.16h) %>% 
+  mutate(!!compare_names[1] := ifelse(!!as.name(compare_names[1]) > limits[2], limits[2], 
+                               ifelse(!!as.name(compare_names[1]) < limits[1], limits[1], 
+                                      !!as.name(compare_names[1])))) %>% 
+  mutate(!!compare_names[2] := ifelse(!!as.name(compare_names[2]) > limits[2], limits[2], 
+                              ifelse(!!as.name(compare_names[2]) < limits[1], limits[1], 
+                                     !!as.name(compare_names[2])))) %>% 
+  ggplot(aes(!!as.name(compare_names[1]), !!as.name(compare_names[2]))) +
+  geom_point(color="red3", size=0.75) +
+  geom_hline(yintercept=c(-25, 25), linetype=2, color="grey20") +
+  geom_vline(xintercept=c(-25, 25), linetype=2, color="grey20") +
+  coord_cartesian(xlim=c(limits[1], limits[2]), ylim=c(limits[1], limits[2])) +
+  labs(x=str_glue("TPM difference of {compare_names[1]} to DMSO"),
+       y=str_glue("TPM difference of {compare_names[2]} to DMSO")) +
+  theme_bw()
+ggsave2(str_glue("{Sys.Date()}_compare_myc_targets_between_celltype_scatter_tpm_difference_to_DMSO.pdf"),
+        width=5, height=5)
+
+```
+

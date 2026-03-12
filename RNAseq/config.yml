@@ -1,0 +1,64 @@
+## RNA-seq Pipeline Configuration File
+
+# ============================= Basic Settings =============================
+# root directory of project
+root_dir: "."
+
+# Directory containing raw FASTQ files
+fastq_dir: 01.RawData
+
+# Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13)
+species: hs
+
+# Sample sheet CSV file (must contain columns: sample,group,control,target,fq1,fq2)
+samplesheet: samplesheet.csv
+
+# Output directory for all results
+outdir: result
+
+# Number of threads for parallel processing
+threads: 8
+
+# Skip preprocessing steps, this is for running non-standard pipelines
+skip_preprocess: false
+
+# ============================= Analysis Options =============================
+
+# Run STAR alignment (generates BAM files)
+# Set to true if you need BAM files for visualization or other downstream analysis
+run_star: true
+
+# Run featureCounts for gene-level quantification
+# Requires run_star: true
+# Note: Salmon already provides transcript/gene counts, featureCounts is optional
+run_featurecounts: true
+
+# ============================= Library Settings =============================
+
+# Library strandedness for featureCounts:
+#   IU  - Unstranded (default)
+#   ISF - Forward stranded (e.g., Illumina TruSeq stranded)
+#   ISR - Reverse stranded (e.g., dUTP-based methods)
+library_type: IU
+
+# ============================= Index Paths =============================
+
+# Root directory containing genome indices
+# Modify this to match your system's index location
+# check helper.sh setup_genome for details
+index_rootdir: /mnt/d/index
+
+# Expected directory structure under index_rootdir:
+#   index_rootdir/
+#   ├── hs/                          # Human
+#   │   ├── salmon/                  # Salmon index
+#   │   ├── star/                    # STAR index
+#   │   └── gencode.v49.basic.annotation.gtf.gz
+#   ├── mm/                          # Mouse
+#   │   ├── salmon/
+#   │   ├── star/
+#   │   └── gencode.vM38.annotation.gtf.gz
+#   └── hs/chm13/                    # Human T2T-CHM13
+#       ├── salmon/
+#       ├── star/
+#       └── chm13v2.0.gtf.gz

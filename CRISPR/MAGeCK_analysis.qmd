@@ -1,0 +1,743 @@
+---
+title: "MAGeCKFlute Analysis for GeCKOv2 Screen"
+author: "Hao He"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+# setup
+
+```{r}
+library(tidyverse)
+library(corrplot)
+library(patchwork)
+library(furrr)
+library(cowplot)
+
+# devtools::install_github("liulab-dfci/MAGeCKFlute")
+library(MAGeCKFlute)
+
+rstudioapi::getActiveDocumentContext()$path |>
+  dirname() |>
+  setwd()
+project_dir <- '.'
+
+source("/home/hao/Documents/GitHub/myScript/pipe_NGS/RNAseq/scripts/RNAseq_helper.R")
+source("/home/hao/Documents/GitHub/myScript/R_functions/ggplot_helper.R")
+
+# project_dir <- "/media/hao/Data1/CRISPR_screen/Library_GeCKOv2/2025-02-14_r-secretase_293T_PB"
+# setwd(project_dir)
+
+counts_dir <- "counts"
+counts_file <- "mageck.count_normalized.txt"
+# counts_file <- "mageck.count.txt"
+
+qc_dir <- "QC"
+rra_dir <- "RRA_analysis"
+mle_dir <- "MLE_analysis"
+
+species <- "hsa"
+top_n <- 20
+
+comparison_names <- c("shNT", "shTEK", "shTEK_shNT")
+```
+
+# fix gene symbol
+```{r}
+if(F) {
+  
+  # devtools::install_github("ncborcherding/exigence")
+  fix_excel <- exigence::reference_HS
+  
+  hgnc_mart <- read_delim("biomart_HGNC.txt", delim="\t") %>% 
+    janitor::clean_names() %>% 
+    filter(status=="Approved") %>% 
+    select(hgnc_id, ncbi_id=ncbi_gene_id, ensembl_id=ensembl_gene_id, 
+           approved_symbol, approved_name, locus_type, 
+           chromosome, alias_symbol, previous_symbol) %>% 
+    glimpse()
+  
+  # save
+  list(fix_excel=fix_excel, hgnc_mart=hgnc_mart) %>% 
+    writexl::write_xlsx("gene_symbol_correction.xlsx")
+  
+  fix_gene_symbol <- function(
+    df, col="symbol", hgnc_mart=NULL, hgnc_mart_annotate=NULL, fix_excel) {
+    
+    if(!is.null(fix_excel)) {
+      tmp <- left_join(df, fix_excel, by=join_by(!!as.name(col) == Exc_Genes))
+      tmp_summary <- filter(tmp, !is.na(Gene_Symbol))
+      if(nrow(tmp_summary) > 0) {
+        df <- mutate(tmp, "{col}" := ifelse(!is.na(Gene_Symbol), Gene_Symbol, !!as.name(col))) %>% 
+          dplyr::select(!Gene_Symbol)
+        # print(tmp_summary)
+        print(str_glue("{nrow(tmp_summary)} excel genes fixed"))
+      } else rm(tmp, tmp_summary)
+    }
+    
+    match <- hgnc_mart %>% 
+      mutate(fixed_symbol=approved_symbol) %>% 
+      pivot_longer(c(approved_symbol, alias_symbol, previous_symbol),
+                   names_to=NULL, values_to="match") %>% 
+      filter(!is.na(match)) %>%
+      arrange(fixed_symbol, locus_type) %>% 
+      select(match, fixed_symbol, any_of(hgnc_mart_annotate)) %>%
+      distinct() #%>% print()
+    df2 <- left_join(df, match, by=join_by(!!as.name(col) == match)) %>% 
+      mutate(fixed_symbol=ifelse(is.na(fixed_symbol), !!as.name(col), fixed_symbol)) %>% 
+      relocate(fixed_symbol, .before=1) %>% 
+      rename("{col}_old" := !!as.name(col), 
+             "{col}" := fixed_symbol)
+    tmp_summary <- filter(df2, !!as.name(str_glue("{col}_old")) != !!as.name(col))
+    if(nrow(tmp_summary) > 0) {
+      # print(tmp_summary)
+      print(str_glue("{nrow(tmp_summary)} genes fixed"))
+    }
+    
+    return(df2)
+  }
+  
+  
+}
+```
+
+```{r}
+# col_names <- file.path(project_dir, counts_dir, counts_file) %>% 
+#   read_table(n_max=5) %>% colnames() %>% .[-1:-2] %>% print()
+# relabel <- col_names %>% 
+#   enframe(name=NULL) %>% 
+#   separate_wider_delim(value, delim="_R", names=c("group", NA), cols_remove=F) %>% 
+#   mutate(rep=row_number(), .by=group) %>% 
+#   mutate(label=str_glue("{group}#{rep}")) %>% 
+#   select(label, value) %>% 
+#   deframe() %>% print()
+
+relabel <- c("shNT#1"="N71_H32Y5ALXX_L1_rep1",
+             "shNT#2"="N71_H32Y5ALXX_L1_rep2",
+             "shTEK#1"="N73_H32Y5ALXX_L1_rep1",
+             "shTEK#2"="N73_H32Y5ALXX_L1_rep2",
+             "Day0#1"="NC_H32Y5ALXX_L1_rep1",
+             "Day0#2"="NC_H32Y5ALXX_L1_rep2"
+             )
+```
+
+# library QC
+```{r}
+countsummary <- file.path(counts_dir, "mageck.countsummary.txt") %>% 
+  read.delim(check.names = F) %>% 
+  mutate(Label=names(relabel)[match(.$Label, relabel)]) %>% 
+  as_tibble()
+glimpse(countsummary)
+
+if(!dir.exists(qc_dir)) dir.create(qc_dir)
+
+p1 <- countsummary %>% 
+  ggplot(aes(Label, 100*Percentage)) +
+  geom_col(fill="#386cb0", width=0.7) +
+  geom_text(aes(label=round(100*Percentage, 0)), angle=90, hjust=-0.1, size=2) +
+  geom_hline(yintercept=100, linetype=2, color="grey50") +
+  coord_cartesian(ylim=c(0, 100)) +
+  labs(x="", y="Reads Mapped Percentage (%)") +
+  my_theme()
+
+p2 <- countsummary %>% 
+  mutate(missing=round(100*(Zerocounts / TotalsgRNAs), 3)) %>% 
+  ggplot(aes(Label, missing)) +
+  geom_col(fill="#386cb0", width=0.7) +
+  geom_text(aes(label=missing), , angle=90, hjust=-0.1, size=2) +
+  geom_hline(yintercept=100, linetype=2, color="grey50") +
+  coord_cartesian(ylim=c(0, 100)) +
+  labs(x="", y="Missing Reads Percentage (%)") +
+  my_theme()
+
+p3 <- countsummary %>% 
+  ggplot(aes(Label, GiniIndex)) +
+  geom_col(fill="#386cb0", width=0.7) +
+  geom_text(aes(label=GiniIndex), angle=90, hjust=-0.1, size=2) +
+  geom_hline(yintercept=1, linetype=2, color="grey50") +
+  coord_cartesian(ylim=c(0, 1)) +
+  labs(x="", y="Gini Index") +
+  my_theme()
+
+ggsave(str_glue("{qc_dir}/{Sys.Date()}_library_qc.pdf"),
+       p1 | p2 | p3, width=5, height=1.5)
+```
+
+## correlation
+```{r}
+counts_norm <- file.path(counts_dir, counts_file) %>% 
+  read_table() %>% 
+  select(!Gene) %>% 
+  column_to_rownames("sgRNA")
+
+colnames(counts_norm) <- colnames(counts_norm) %>% 
+  match(., relabel) %>% names(relabel)[.]
+head(counts_norm)
+
+pdf(str_glue("{qc_dir}/{Sys.Date()}_sample_correlation.pdf"), 
+    width = 5, height = 5)
+
+counts_norm %>%
+  cor() %>%
+  corrplot.mixed(
+    lower = "number", upper = "circle",
+    order = "hclust",
+    tl.cex = 0.4,
+    number.cex = 0.6,
+    number.digits = 3,
+    lower.col=colorRampPalette(c("#386cb0","white","#d73027"))(200),
+    upper.col=colorRampPalette(c("#386cb0","white","#d73027"))(200),
+    tl.col="black")
+
+counts_norm %>% 
+  cor() %>%
+  pheatmap::pheatmap(
+    scale = "none", 
+    border_color = NA,
+    col = colorRampPalette(RColorBrewer::brewer.pal(9, "Blues"))(255),
+    # annotation_col = col_data[, "contrast", drop = F], 
+    # annotation_row = col_data[, "contrast", drop = F], 
+    # filename = str_glue("{Sys.Date()}_sample_correlation.pdf"),
+    # width = ceiling(nrow(col_data)/2), 
+    # height = ceiling(nrow(col_data)/2),
+    main = str_glue("Sample correlation")
+  ) %>% 
+  print()
+while(dev.cur() != 1) dev.off()
+```
+
+## MDS
+```{r}
+# MDS using Poisson Distance
+require("PoiClaClu")
+poisd <- 
+  counts_norm %>% 
+  select(!starts_with("APP")) %>% 
+  t() %>% 
+  PoiClaClu::PoissonDistance() %>% 
+  .$dd %>% 
+  as.matrix() %>% 
+  magrittr::set_colnames(colnames(counts_norm)) %>% 
+  magrittr::set_rownames(colnames(counts_norm))
+mds <- poisd %>% 
+  cmdscale() %>% 
+  as.data.frame() %>% 
+  magrittr::set_colnames(c("MDS_1", "MDS_2")) %>% 
+  as_tibble(rownames="sample") %>% 
+  separate_wider_delim(sample, "#", names=c("Group", "Rep"), cols_remove = F)
+
+# plot mds
+p <- mds %>% 
+  ggplot(aes(MDS_1, MDS_2, color=Group)) +
+  geom_point(size=2) +
+  ggrepel::geom_text_repel(aes(label=sample), size=2) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid = element_blank(),
+        legend.title = element_blank(),
+        legend.text = element_text(size=4))
+cowplot::ggsave2(str_glue("{qc_dir}/{Sys.Date()}_sample_mds_poisson_distance.pdf"), 
+                 p, width=3, height=2.5)
+```
+
+
+# **------- RRA analysis
+
+## read data
+```{r}
+gene_summary_paths <- str_c(comparison_names, ".gene_summary.txt", sep="") %>% 
+  map_chr(~ file.path(rra_dir, .x)) %>% 
+  set_names(nm=comparison_names)
+
+sgrna_summary_paths <- str_c(comparison_names, ".sgrna_summary.txt", sep="") %>% 
+  map_chr(~ file.path(rra_dir, .x)) %>% 
+  set_names(nm=comparison_names)
+
+
+read_rra_gene <- function(gene_summary_file) {
+  gene_summary <- read_table(gene_summary_file) %>% 
+    rename(symbol=id, lfc=`neg|lfc`) %>% 
+    mutate(score=ifelse(`neg|score` < `pos|score`, 
+                        log10(`neg|score`), -log10(`pos|score`))) %>% 
+    mutate(pvalue=ifelse(`neg|score` < `pos|score`, 
+                         `neg|p-value`, `pos|p-value`)) %>% 
+    mutate(logpvalue=-log10(pvalue)) %>% 
+    mutate(fdr=ifelse(`neg|score` < `pos|score`, 
+                         `neg|fdr`, `pos|fdr`)) %>% 
+    mutate(goodsgrna=ifelse(`neg|score` < `pos|score`, 
+                            `neg|goodsgrna`, `pos|goodsgrna`)) %>% 
+    select(symbol, goodsgrna, lfc, score, pvalue, logpvalue, fdr) %>% 
+    arrange(score)
+  
+  return(gene_summary)
+}
+
+read_rra_sgrna <- function(sgrna_summary_file) {
+  sgrna_summary <- read_table(sgrna_summary_file) %>% 
+    transmute(sgrna,
+              symbol=Gene, 
+              control_count, treatment_count,
+              control_mean, treat_mean,
+              score, pvalue=p.twosided, 
+              lfc=LFC, high_in_treatment)
+  
+  return(sgrna_summary)
+}
+
+hgnc_mart <- readxl::read_excel("gene_symbol_correction.xlsx", "hgnc_mart")
+fix_excel <- readxl::read_excel("gene_symbol_correction.xlsx", "fix_excel")
+
+gene_datalist <- gene_summary_paths %>% map(read_rra_gene) %>% 
+  modify(\(x) fix_gene_symbol(x, "symbol", hgnc_mart=hgnc_mart, 
+                              hgnc_mart_annotate=c("locus_type"), 
+                              fix_excel=fix_excel))
+
+sgrna_datalist <- sgrna_summary_paths %>% map(read_rra_sgrna) %>% 
+  modify(\(x) fix_gene_symbol(x, "symbol", hgnc_mart=hgnc_mart, 
+                              hgnc_mart_annotate=c("locus_type"), 
+                              fix_excel=fix_excel))
+```
+
+## add TPM
+```{r}
+# library(hpar)
+expr_tpm <- hpar::rnaGeneCellLine()
+expr_tpm <- expr_tpm %>%
+  as_tibble() %>% 
+  filter(str_detect(Cell.line, "HUVEC")) %>% 
+  select(symbol=Gene.name, tpm=nTPM)
+
+gene_datalist <- gene_datalist %>% 
+  modify(\(x) right_join(expr_tpm, x))
+```
+
+## add DepMap
+```{r}
+# common essential genes
+common_essential <- read_csv("Gene Dependency Profile Summary.csv") %>% 
+  filter(Dataset == "DependencyEnum.Chronos_Combined") %>% 
+  # filter(`Common Essential`) %>% 
+  # filter(`Strongly Selective`) %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(symbol=gene, common_essential, strongly_selective) %>% 
+  print()
+
+# library(depmap)
+depmap <- depmap::depmap_crispr()
+depmap_mean <- depmap %>% 
+  reframe(dependency=mean(dependency, na.rm=T), .by=gene_name) %>% 
+  rename(symbol=gene_name)
+
+# merge with common_essential
+depmap_mean <- depmap_mean %>% 
+  left_join(common_essential)
+
+# annotate
+gene_datalist <- gene_datalist %>% 
+  modify(\(x) right_join(depmap_mean, x))
+
+
+p1 <- gene_datalist %>% 
+  list_rbind(names_to="group") %>% 
+  # filter(!strongly_selective) %>% 
+  filter(!is.na(common_essential)) %>%
+  # mutate(label=ifelse(rank<=5 | (nrow(gene_datalist[[1]])-rank)<=5, symbol, NA), .by = group) %>%
+  # mutate(sig=ifelse(pvalue<0.01 & lfc > 0.58, "pos",
+  #                   ifelse(pvalue<0.01 & lfc < -0.58, "neg", "ns")), .by = group) %>%
+  ggplot(aes(dependency, lfc, color=common_essential)) +
+  geom_point(size=0.5, alpha=0.5) +
+  geom_smooth(method="lm", show.legend=T) +
+  ggpubr::stat_cor(size=2, show.legend=F) +
+  guides(color=guide_legend(position="top")) +
+  geom_vline(xintercept=c(0), linetype=2, color="grey50") +
+  geom_hline(yintercept=c(0), linetype=2, color="grey50") +
+  # ggrepel::geom_text_repel(aes(label=label), color="gray20",
+  #                          segment.color="grey80",
+  #                          max.overlaps = 30, size=3) +
+  scale_color_manual(values=c("FALSE"="grey25", "TRUE"="#e41a1c", "NA"="grey50")) +
+  labs(x="Dependency (DepMap Chronos 25Q2)", y="Log2(FoldChange)") +
+  facet_wrap(~ group, scales="fixed", nrow=1, axes="all") +
+  theme_bw() +
+  theme(strip.background = element_rect(fill=NA),
+        panel.grid=element_blank())
+p1 <- ggrastr::rasterize(p1, dpi=600)
+cowplot::ggsave2(str_glue("{rra_dir}/{Sys.Date()}_rra_depmap.pdf"), 
+                 p1, width=length(gene_datalist) * 2.5, height=3)
+```
+
+## volcano plot
+```{r}
+p1 <- gene_datalist %>% 
+  list_rbind(names_to="group") %>% 
+  mutate(rank=rank(score), .by=group) %>%
+  # mutate(label=ifelse(rank<=5 | (nrow(gene_datalist[[1]])-rank)<=5, symbol, NA), .by = group) %>%
+  mutate(sig=ifelse(pvalue<0.05 & lfc > 0.58, "pos",
+                    ifelse(pvalue<0.05 & lfc < -0.58, "neg", "ns")), .by = group) %>%
+  ggplot(aes(lfc, logpvalue, color=sig)) +
+  geom_point(size=0.5, alpha=0.5, show.legend=F) +
+  geom_vline(xintercept=c(-0.58, 0.58), linetype=2, color="grey50") +
+  geom_hline(yintercept=c(-log10(0.05)), linetype=2, color="grey50") +
+  # ggrepel::geom_text_repel(aes(label=label), color="gray20",
+  #                          segment.color="grey80",
+  #                          max.overlaps = 30, size=3) +
+  scale_color_manual(values=c("pos"="#e41a1c", "neg"="#377eb8", "ns"="grey50")) +
+  labs(x="log2(FoldChange)", y="-log10(pvalue)", caption="pvalue < 0.05, |lfc| > 0.58") +
+  facet_wrap(~ group, scales="fixed", nrow=1, axes="all") +
+  theme_bw() +
+  theme(strip.background = element_rect(fill=NA),
+        panel.grid=element_blank())
+p1 <- ggrastr::rasterize(p1, dpi=600)
+cowplot::ggsave2(str_glue("{rra_dir}/{Sys.Date()}_rra_volcano.pdf"), 
+                 p1, width=length(gene_datalist) * 2.5, height=3)
+```
+
+## rank plot
+```{r}
+p2 <- gene_datalist %>% 
+  list_rbind(names_to="group") %>% 
+  mutate(rank=rank(score), .by=group) %>%
+  # mutate(label=ifelse(rank<=100 | (nrow(gene_datalist[[1]])-rank)<=100, symbol, NA), .by = group) %>%
+  mutate(top=ifelse(rank<=100, "pos",
+                      ifelse((nrow(gene_datalist[[1]])-rank)<=100, "neg", "ns")), .by = group) %>%
+  ggplot(aes(rank, score, color=top)) +
+  geom_point(size=0.5, alpha=0.7, show.legend=F) +
+  # ggrepel::geom_text_repel(aes(label=top), color="gray20",
+  #                          segment.color="grey80",
+  #                          max.overlaps = 30, size=3) +
+  scale_color_manual(values=c("pos"="#e41a1c", "neg"="#377eb8", "ns"="grey50")) +
+  labs(x="Rank", y="Score", caption="colored by ranking top 100") +
+  facet_wrap(~ group, scales="fixed", nrow=1, axes="all") +
+  theme_bw() +
+  theme(strip.background = element_rect(fill=NA))
+p2 <- ggrastr::rasterize(p2, dpi=600)
+cowplot::ggsave2(str_glue("{rra_dir}/{Sys.Date()}_rra_rank.pdf"), 
+                 p2, width=length(gene_datalist) * 2, height=3)
+```
+
+## NT control
+```{r}
+p <- gene_datalist %>% 
+  list_rbind(names_to="group") %>% 
+  filter(str_detect(symbol, "^NonTargetingControl")) %>% 
+  ggplot(aes(lfc, group, color=group, fill=group)) +
+  # ggridges::geom_density_ridges(scale=1.2) +
+  ggridges::geom_density_ridges(
+    jittered_points = TRUE,
+    position = ggridges::position_points_jitter(width = 0.05, height = 0),
+    point_shape = '|', point_size = 2, point_alpha = 1, alpha = 0.5,
+    show.legend=F) +
+  # geom_histogram(binwidth=0.02, color=" +grey25") +
+  # geom_density() +
+  # geom_point(size=0.5, alpha=0.7, show.legend=F) +
+  # ggrepel::geom_text_repel(aes(label=top), color="gray20",
+  #                          segment.color="grey80",
+  #                          max.overlaps = 30, size=3) +
+  # scale_color_manual(values=c("pos"="#e41a1c", "neg"="#377eb8", "ns"="grey50")) +
+  # labs(x="Rank", y="Score", caption="colored by ranking top 100") +
+  # facet_wrap(~ group, scales="fixed", nrow=1, axes="all") +
+  coord_cartesian(clip = "off") +
+  theme_bw() +
+  theme(strip.background = element_rect(fill=NA))
+p <- ggrastr::rasterize(p, dpi=600)
+ggsave(str_glue("{rra_dir}/{Sys.Date()}_rra_NT_density.pdf"), 
+                 p, width=5, height=length(gene_datalist) * 1)
+```
+
+## GSEA
+```{r}
+genelist <- gene_datalist %>% 
+  map(\(x) select(x, symbol, score) %>% 
+    distinct(symbol, .keep_all=T) %>% 
+    arrange(desc(score)) %>% 
+    deframe())
+
+# geneset
+msigdb <- msigdbr::msigdbr("Homo sapiens")
+genesets <- list(
+  ## H
+  # Hallmark = filter(msigdb, gs_collection == "H"),
+  ## GO
+  GOBP = filter(msigdb, gs_subcollection == "GO:BP")
+  # GOMF = filter(msigdb, gs_subcollection == "GO:MF"),
+  # GOCC = filter(msigdb, gs_subcollection == "GO:CC"),
+) %>% 
+  # get gs_name to tidy format
+  map(\(x) dplyr::select(x, gs_id=gs_exact_source, gs_name, gene_symbol) %>% 
+        mutate(gs_id=ifelse(gs_id=="", gs_name, gs_id))) %>% 
+  map(\(x) list(term2gene=x[, c("gs_id", "gene_symbol")],
+                term2name=x[, c("gs_id", "gs_name")]))
+
+# gsea
+enrich_result_gsea <- enrich_gsea_list(genelist, genesets)
+
+
+# save data
+writexl::write_xlsx(map(enrich_result_gsea, \(x) as_tibble(x@result)), 
+           str_glue("{rra_dir}/{Sys.Date()}_rra_gsea.xlsx"))
+# save plot
+n_col <- length(enrich_result_gsea) #if_else( > 1, 2, 1)
+map(enrich_result_gsea, 
+    \(x) plot_enrich_gsea(x@result, facet_by="Category")) %>%
+  plot_grid(plotlist = ., 
+            labels = names(enrich_result_gsea), 
+            ncol = n_col, 
+            axis = "tblr", align = "hv", 
+            label_size = 8, scale = 0.9) %>% 
+  ggsave(str_glue("{rra_dir}/{Sys.Date()}_rra_gsea.pdf"),
+         .,
+         width=n_col*6, 
+         height=length(genesets)*5, 
+         limitsize = F)
+```
+
+## GSEA visNetwork
+```{r}
+pvalue_cutoff <- 0.05
+min_cluster_size <- 5
+plist <- list()
+
+for(x in names(enrich_result_gsea)) {
+  print(str_glue("visNetwork >>> {x}"))
+  plist[[x]] <- enrich_result_gsea[[x]]@result %>% 
+    filter(pvalue < pvalue_cutoff) %>% 
+    aPEAR::enrichmentNetwork(
+      simMethod = "jaccard", # c('jaccard', 'cosine', 'cor'),
+      clustMethod = "markov", # c('markov', 'hier', 'spectral'),
+      clustNameMethod = "pagerank", # c('pagerank', 'hits', 'none'),
+      minClusterSize = min_cluster_size, # min number of nodes in a single cluster
+      colorBy = "NES", # pvalue, NES
+      colorType = "nes", # use log transform on the colorBy column and adjust color range
+      nodeSize = "setSize",
+      innerCutoff = 0.1, # similarity cutoff for in-cluster nodes
+      outerCutoff = 0.5, # similarity cutoff for between-cluster nodes
+      pCutoff = -5, # adjust p-value colouring cutoff when using pval
+      drawEllipses = F,
+      fontSize = 4,
+      repelLabels = F,
+      plotOnly = T,
+      verbose = F) }
+
+# save plot
+plot_grid(plotlist = plist, 
+          labels = names(enrich_result_gsea), 
+          ncol = 1, axis = "tblr", align = "hv", 
+          label_size = 8, scale = 0.9) %>% 
+  ggsave(str_glue(
+    "{rra_dir}/{Sys.Date()}_rra_gesa_visNetwork.pdf"),
+    ., width=10, height=length(enrich_result_gsea)*10, limitsize = F)
+```
+
+## selected genes
+```{r}
+targets <- c("shNT", "shTEK", "shTEK_shNT")
+gene_datalist_targets <- list()
+
+for(target in targets) {
+  retained_genes <- gene_datalist[[target]] %>% 
+    # filter(!(tpm < 2 | pvalue > 0.05 | goodsgrna < 3)) %>% 
+    # filter((pvalue < 0.01)) %>% 
+    filter((pvalue < 0.05)) %>% 
+    pull(symbol)
+  gene_datalist_target <- gene_datalist %>% 
+    modify(\(x) mutate(
+      x, generated_retained=ifelse(symbol %in% retained_genes, "yes", "no"))) %>% 
+    list_rbind(names_to="group") %>% 
+    arrange(score) %>% 
+    filter(generated_retained=="yes") %>% 
+    pivot_wider(names_from=group, values_from=lfc:fdr) %>% 
+    print()
+  
+  gene_datalist_targets[[target]] <- gene_datalist_target
+  
+  p <- gene_datalist_target %>% 
+    # mutate(label=ifelse(rank<=100 | (nrow(gene_datalist[[1]])-rank)<=100, symbol, NA), .by = group) %>%
+    # mutate(label=ifelse(rank<=100, "pos",
+    #                     ifelse((nrow(gene_datalist[[1]])-rank)<=100, "neg", "ns")), .by = group) %>%
+    ggplot(aes(score_shNT, score_shTEK, color=logpvalue_shTEK)) +
+    geom_point(size=1, alpha=1, show.legend=T) +
+    # ggrepel::geom_text_repel(aes(label=label), color="gray20",
+    #                          segment.color="grey80",
+    #                          max.overlaps = 30, size=3) +
+    scale_color_viridis_c() +
+    coord_equal() +
+    theme_bw() +
+    theme(strip.background = element_rect(fill=NA))
+  p <- ggrastr::rasterize(p, dpi=600)
+  cowplot::ggsave2(str_glue("{rra_dir}/{Sys.Date()}_rra_{target}_selected_pairwise_score.pdf"), 
+                   p, width=5, height=5)
+  
+  p <- gene_datalist_target %>% 
+    # mutate(label=ifelse(rank<=100 | (nrow(gene_datalist[[1]])-rank)<=100, symbol, NA), .by = group) %>%
+    # mutate(label=ifelse(rank<=100, "pos",
+    #                     ifelse((nrow(gene_datalist[[1]])-rank)<=100, "neg", "ns")), .by = group) %>%
+    ggplot(aes(lfc_shNT, lfc_shTEK, color=logpvalue_shTEK)) +
+    geom_point(size=1, alpha=1, show.legend=T) +
+    # ggrepel::geom_text_repel(aes(label=label), color="gray20",
+    #                          segment.color="grey80",
+    #                          max.overlaps = 30, size=3) +
+    scale_color_viridis_c() +
+    coord_fixed() +
+    theme_bw() +
+    theme(strip.background = element_rect(fill=NA))
+  p <- ggrastr::rasterize(p, dpi=600)
+  cowplot::ggsave2(str_glue("{rra_dir}/{Sys.Date()}_rra_{target}_selected_pairwise_lfc.pdf"), 
+                   p, width=5, height=5)
+}
+
+
+
+# interactivately
+tmp <- gene_datalist_targets$shTEK_shNT %>% 
+  ggplot(aes(score_shNT, score_shTEK, color=logpvalue_shTEK)) +
+  ggiraph::geom_point_interactive(aes(
+    tooltip=str_c(symbol, "\n", pvalue_shTEK), data_id = symbol)) + 
+  scale_color_viridis_c() +
+  coord_equal() +
+  theme_bw() +
+  theme(strip.background = element_rect(fill=NA))
+ggiraph::girafe(ggobj = tmp)
+```
+
+
+## sgRNA plot
+```{r}
+# top_n <- 5
+# top_sgrna_list <- gene_datalist %>% 
+#   map(~ slice_max(.x, score, n=top_n) %>% pull(symbol))
+
+p <- map2(sgrna_datalist, top_sgrna_list,
+     ~ filter(.x, symbol %in% .y) %>% 
+       # bind_rows(.id="group") %>%
+       mutate(lfc=ifelse(lfc > 5, 5, lfc)) %>%
+       mutate(lfc=ifelse(lfc < -5, -5, lfc)) %>%
+       ggplot(aes(lfc, y=1)) +
+       geom_vline(xintercept = 0, color="red3") +
+       geom_segment(aes(xend=lfc, yend=0, color=lfc)) +
+       scale_color_viridis_c() +
+       guides(color="none") +
+       facet_grid(rows = vars(symbol), axes="margins") +
+       # coord_cartesian(xlim=c(-1, 1)) +
+       labs(x="log2FoldChange", y="") +
+       theme_bw(4) +
+       theme(panel.grid = element_blank(),
+             axis.text.y = element_blank(),
+             axis.ticks = element_blank(),
+             strip.background = element_rect(fill=NA))) %>%
+  cowplot::plot_grid(plotlist = . ,nrow = 1, 
+                     labels = names(.), label_size=4,
+                     scale = 0.95)
+cowplot::ggsave2(str_glue("{rra_dir}/{Sys.Date()}_rra_sgrna.pdf"),
+                 p, width = length(top_sgrna_list) * 1.5, height=top_n/5)
+```
+
+
+## save data
+```{r}
+gene_datalist %>% 
+  writexl::write_xlsx(path=str_glue("{rra_dir}/{Sys.Date()}_rra.xlsx"))
+
+gene_datalist %>% 
+  modify(\(x) filter(x, !(pvalue >= 0.05 | goodsgrna < 3)) %>% 
+           filter(locus_type == "gene with protein product") %>% 
+           arrange(score)) %>% 
+  writexl::write_xlsx(path=str_glue("{rra_dir}/{Sys.Date()}_rra_filtered.xlsx"))
+```
+
+
+
+
+# **------- MLE analysis
+
+## read mle data
+```{r}
+mle_data <- file.path(mle_dir, "mle.gene_summary.txt") %>% 
+  read_table() %>% 
+  # select(symbol=Gene, n_sgRNA=sgRNA, ends_with("beta"), ends_with("p-value")) %>% 
+  rename_with(~ str_replace_all(.x, fixed("|beta"), ""), ends_with("beta"))
+
+# normalized beta score
+mle_data_norm = NormalizeBeta(mle_data, 
+                              id = 1,
+                              method="cell_cyle",
+                              samples=comparison_names,
+                              org="hsa")
+```
+
+
+## beta distribution
+```{r}
+pdf(str_glue("{mle_dir}/{Sys.Date()}_mle_vis.pdf"), width = 5, height = 5)
+DensityView(mle_data, samples=comparison_names, xlab="Beta Score")
+DensityView(mle_data_norm, samples=comparison_names, xlab="Normalized Beta Score")
+ConsistencyView(mle_data, comparison_names[1], comparison_names[2], main="raw cell cycle consistency")
+ConsistencyView(mle_data_norm, comparison_names[1], comparison_names[2], main="normalized cell cycle consistency")
+
+ScatterView(mle_data_norm, 
+            x=comparison_names[1], y=comparison_names[2], 
+            model = "none",
+            groups = c("top", "bottom"),
+            label = "Gene", top=10,
+            auto_cut_diag = TRUE, display_cut = TRUE, 
+            # toplabels = c("Pbrm1", "Brd7", "Arid2", "Jak1", "Stat1", "B2m")
+)
+ScatterView(mle_data_norm, 
+            x=comparison_names[1], y=comparison_names[2], 
+            model = "ninesquare",
+            label = "Gene", top=10,
+            auto_cut_diag = TRUE, display_cut = TRUE, 
+            # toplabels = c("Pbrm1", "Brd7", "Arid2", "Jak1", "Stat1", "B2m")
+) + coord_cartesian(xlim=c(-1.5, 1.5), ylim=c(-1.5, 1.5))
+
+
+
+groups = c("top", "bottom")
+while(dev.cur() != 1) dev.off() 
+```
+
+
+## pairwise compare
+```{r}
+
+min_nsgnra <- 5
+mle_data_norm_sig_L <- mle_data_norm %>% 
+  select(!contains("_H")) %>% 
+  filter(`APP_L|p-value` < 0.01 | `NOTCH1_L|p-value` < 0.01) %>%
+  filter(n_sgRNA >= min_nsgnra) %>% 
+  arrange(desc(APP_L), desc(NOTCH1_L))
+mle_data_norm_sig_H <- mle_data_norm %>% 
+  select(!contains("_L")) %>% 
+  filter(`APP_H|p-value` < 0.01 | `NOTCH1_H|p-value` < 0.01) %>%
+  filter(n_sgRNA >= min_nsgnra) %>% 
+  arrange(desc(APP_H), desc(NOTCH1_H))
+writexl::write_xlsx(
+  list(mle_data_norm=mle_data_norm, 
+       mle_data_norm_sig_L=mle_data_norm_sig_L, 
+       mle_data_norm_sig_H=mle_data_norm_sig_H),
+  path=str_glue("{mle_dir}/{Sys.Date()}_mle_merged_one_table.xlsx"))
+
+p_l <- mle_data_norm_sig_L %>% 
+  ggplot(aes(APP_L, NOTCH1_L, color=Gal4DBD_L)) +
+  geom_point() +
+  scale_size_continuous(range=c(0.5, 3)) +
+  scale_color_viridis_c() +
+  geom_vline(xintercept=0, linetype=2) +
+  geom_hline(yintercept=0, linetype=2) +
+  my_theme(0) +
+  theme(legend.position="top")
+p_h <- mle_data_norm_sig_H %>% 
+  ggplot(aes(APP_H, NOTCH1_H, color=Gal4DBD_H)) +
+  geom_point() +
+  scale_size_continuous(range=c(0.5, 3)) +
+  scale_color_viridis_c() +
+  geom_vline(xintercept=0, linetype=2) +
+  geom_hline(yintercept=0, linetype=2) +
+  my_theme(0) +
+  theme(legend.position="top")
+ggsave(str_glue("{mle_dir}/{Sys.Date()}_mle_compare_betapdf"),
+       p_l | p_h, width=7, height=4)
+```
+
+
+
+

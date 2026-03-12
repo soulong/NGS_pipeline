@@ -1,0 +1,903 @@
+---
+title: "RNAseq Pathway Enrichment Analysis"
+author: "Hao He"
+date: "`r Sys.time()`"
+editor_options:
+  chunk_output_type: console
+params:
+  # project directory
+  root_dir: "D:\\20260211_RNA_seq"
+  # hs or mm
+  species: "hs" 
+  # general setting
+  samplesheet: "samplesheet.csv" 
+  deg_padj: 0.01
+  deg_fc: 1.5
+  deg_threshold: 2 # tpm threshold at least in one group for plot heatmmap
+  deseq2_dir: "deseq2"
+  enrichment_dir: "enrichment"
+  wald_test_suffix: "_wald_result.xlsx" 
+  expr_file_suffix: "_norm_expression.xlsx"
+  quantification_dir: "quantification"
+--- 
+
+# Setup
+```{r, include=FALSE, cache = FALSE}
+# options("repos" = c(CRAN = "http://mirrors.tuna.tsinghua.edu.cn/CRAN/"))
+# options(BioC_mirror = "http://mirrors.tuna.tsinghua.edu.cn/bioconductor")
+script_path <- rstudioapi::getActiveDocumentContext()$path |> dirname()
+source(file.path(script_path, "RNAseq_helper.R"))
+
+# knitr::opts_knit$set(root.dir=dirname(f_path))
+setwd(params$root_dir)
+knitr::opts_chunk$set(echo=TRUE, results="hold", cache=TRUE)
+
+species <- params$species
+deg_padj <- params$deg_padj
+deg_fc <- params$deg_fc
+deg_threshold <- params$deg_threshold
+deseq2_dir <- params$deseq2_dir
+wald_test_suffix <- params$wald_test_suffix
+enrichment_dir <- params$enrichment_dir
+expr_file_suffix <- params$expr_file_suffix
+quantification_dir <- params$quantification_dir
+samplesheet <- params$samplesheet
+
+# require(OmnipathR)
+# library(progeny)
+# library(decoupleR)
+library(tidyverse)
+library(msigdbr)
+library(clusterProfiler)
+library(GSVA)
+library(enrichplot)
+library(pathview)
+library(pheatmap)
+library(factoextra)
+library(ComplexHeatmap)
+library(GseaVis)
+require(smerc)
+require(circlize)
+#devtools::install_github('ievaKer/aPEAR')
+library(aPEAR)
+library(patchwork)
+library(rio)
+options(rio.import.class='tbl')
+library(furrr)
+plan(multisession, workers=8)
+# plan(sequential)
+```
+
+
+## read sample info
+```{r}
+sample <- import(samplesheet)
+```
+
+## read expression
+```{r}
+# all deg must be within expr filtered mat
+expr_file <- list.files(
+  quantification_dir, expr_file_suffix, full.names = T) %>% 
+  str_subset("^[^~]") %>% last() %>% print()
+
+# convert to matrix
+use_data <- "tpm" # tpm, vst, counts_norm
+expr_data <- import(expr_file, which=use_data) %>%
+    select(all_of(c("symbol", sample$sample))) %>%
+  # filter by expr
+  filter_df_by_group(
+    sample[["group"]] %>% set_names(sample$sample), 
+    threshold = deg_threshold) %>% 
+  filter(!is.na(symbol)) %>%
+  distinct(symbol, .keep_all=T)
+
+# check dims
+dim(expr_data)
+expr_data[1:5,1:5]
+```
+
+
+# Comparison Based
+## read wald result
+```{r}
+# get wald test result file
+wald_test_file <- list.files(deseq2_dir, wald_test_suffix, full.names = T) %>% 
+  str_subset("^[^~]") %>% last() %>% print()
+
+# read multi-sheet data
+comparison <- readxl::excel_sheets(wald_test_file)
+cat(str_glue("{str_c(comparison, collapse='\n')}"))
+wald_test <- comparison %>% set_names(comparison) %>% 
+  map(\(x) import(wald_test_file, which=x) %>% 
+        # order by stats
+        arrange(desc(stat), pvalue) )
+
+# get ranked genelist, for GSEA
+genelist_ranked <- wald_test %>% 
+  map(\(x) distinct(x, symbol, .keep_all = T) %>% 
+        arrange(desc(stat)) %>% 
+        select(symbol, stat) %>% deframe())
+
+# subset sig deg
+print("filter out comparison by < 20 sig genes")
+wald_test_sig <- wald_test %>% 
+  map(\(x) filter(
+    x, abs(log2FoldChange) > log2(deg_fc), padj < deg_padj) %>% 
+      {if(exists("expr_data")) filter(., symbol %in% expr_data$symbol) else .} ) %>% 
+  # remove comparison which has less sig genes
+  .[map_int(., nrow) > 20] %>% 
+  map(\(x) pull(x, symbol))
+
+glimpse(wald_test_sig)
+```
+
+## make geneset
+```{r}
+if(!exists("genesets")) {
+  print("prepare term2gene geneset from msigdbr")
+  # msigdbr::msigdbr_show_species()
+  # msigdbr::msigdbr_collections()
+  
+  # msigdb <- msigdbr::msigdbr(
+  #   species = if_else(species=="hs", "Homo sapiens", "Mus musculus"))
+  
+  ## subset genesets
+  genesets <- list(
+    ## H
+    # Hallmark = filter(msigdb, gs_cat == "H")
+    ## GO
+    # GOBP = filter(msigdb, gs_subcat == "GO:BP")
+    # GOMF = filter(msigdb, gs_subcat == "GO:MF"),
+    # GOCC = filter(msigdb, gs_subcat == "GO:CC"),
+    ## cannonical pathway
+    # KEGG = filter(msigdb, gs_subcat == "CP:KEGG"),
+    # PID = filter(msigdb, gs_subcat == "CP:PID"),
+    # BIOCARTA = filter(msigdb, gs_subcat == "CP:BIOCARTA"),
+    # WikiPathway = filter(msigdb, gs_subcat == "CP:WIKIPATHWAYS"),
+    # Reactome = filter(msigdb, gs_subcat == "CP:REACTOME")
+    ## TF
+  ) %>% 
+    # get gs_name to tidy format
+    map(\(x) dplyr::select(x, gs_id=gs_exact_source, gs_name, gene_symbol) %>% 
+          mutate(gs_id=ifelse(gs_id=="", gs_name, gs_id)))
+    
+  ## self defined geneset
+  if(F) {
+    yap_targets <- c(
+      "CTGF","CCN2","ANKRD1","CYR61","CCN1","TOP2A","KIF14","CCNA2",
+      "CDCA8","CENPF","KIF23","KIF20B","KNTC1","RRM2",
+      "MCM3","SGOL1.AS1","TUBB","MYBL1","RAD18",
+      "ZWILCH","SGOL1","TIMELESS","GINS1","SMC3","TK1",
+      "MRE11A","MCM7","SUV39H2","GADD45B","FOSL1","CENPV",
+      "RUVBL2","MYC","GLI2","AXL","ABCB1","CAT","GPATCH4",
+      "LMNB2","TXN","WSB2","AREG","FOXF2","IGFBP3","RASSF2",
+      "AMOTL2","NPPB","CCND1") %>%
+      str_trim() %>% unique() %>% str_to_upper()
+    yap_targets <- crossing(
+      gs_id="HALLMARK_YAP_TARGETS",
+      gs_name = "HALLMARK_YAP_TARGETS", 
+      gene_symbol = yap_targets)
+    # add to Hallmark
+    genesets$Hallmark <- genesets$Hallmark %>% 
+      bind_rows(yap_targets)
+  }
+  
+  # to list
+  genesets <- genesets %>% 
+    map(\(x) list(term2gene=x[, c("gs_id", "gene_symbol")],
+                  term2name=x[, c("gs_id", "gs_name")]))
+}
+```
+
+## DEGs cluster
+### optimal k
+```{r}
+mat <- expr_data[,] %>% 
+  filter(symbol %in% unique(unlist(wald_test_sig))) %>%
+  # filter(symbol %in% yap_targets$gene_symbol) %>%
+  column_to_rownames("symbol") %>% 
+  scale_mat(by="row")
+mat[1:5,1:5]
+
+if(T) {
+  # optimal clusters
+  elbow_plot <- mat %>% 
+    # fviz_nbclust(kmeans, method="silhouette", k.max=20)
+    fviz_nbclust(kmeans, method="wss", k.max=20)
+  print(elbow_plot)
+  k <- smerc::elbow_point(as.integer(elbow_plot$data$clusters), elbow_plot$data$y) %>% 
+    .[["x"]] %>% print()
+} else k <- 4 # defined by hand
+```
+
+### mark gene
+```{r}
+# mark gene
+pathway <- c("HALLMARK_MYC_TARGETS_V1","HALLMARK_MYC_TARGETS_V2")
+mark_gene <- list_flatten(genesets) %>% 
+  .[str_detect(names(.), "term2gene")] %>% 
+  list_rbind() %>% 
+  filter(gs_id %in% pathway) %>% 
+  pull(gene_symbol) %>% 
+  intersect(rownames(mat))
+# mark_gene <- sample(rownames(mat), 40)
+mark_gene <- anno_mark(
+  at = match(mark_gene, rownames(mat)), labels = mark_gene,
+  labels_gp = gpar(fontsize=5), which = "row")
+# mark_gene <- NULL
+```
+
+### annotation
+```{r}
+# sample anno
+anno_col_list <- annoCol_from_sample_info(sample, split_by="group", annotate_col=NULL)
+
+# cluster by row
+anno_cl_list <- annoRow_from_cluster(mat, k)
+
+# box trend plot by cluster
+box_color <- anno_col_list$sample_split_color
+plot_boxtrend <- as_tibble(mat, rownames="symbol") %>% 
+  bind_cols(cluster=anno_cl_list$cl$cluster, .) %>% 
+  pivot_longer(!c(cluster, symbol), names_to="sample") %>% 
+  left_join(sample, by = join_by(sample)) %>% 
+  split(., .[["cluster"]]) %>% 
+  map(\(x) ggplot(x) + geom_boxplot(
+    aes(contrast, value), 
+    # fill=unique(box_color) %>% set_names(unique(names(box_color))),
+    color=unique(box_color) %>% set_names(unique(names(box_color))),
+    width=0.4, linewidth=0.5, outliers=F, staplewidth=0.5) +
+      geom_line(
+        aes(contrast, value, group=1), linewidth=1, color="red3",
+        data=reframe(x, value=mean(value), .by=contrast)) +
+      labs(x="", y="") +
+      theme_bw(4) +
+      theme(axis.text.x = element_blank(),
+            axis.ticks = element_blank(),
+            panel.grid = element_blank()) )
+# plot_boxtrend[[1]]
+anno_boxtrend <- anno_gglist(
+  align_to=anno_cl_list$align_to, gglist=plot_boxtrend, 
+  # panel size, gap, width, fill, color
+  ggplot.panel.arg = c(2, 0.4, 4, "grey90","grey30"))
+
+# anno_BoxTrend(
+#   mat, 
+#   align_to=anno_cl_list$align_to, cl=anno_cl_list$cl, 
+#   sample_df=sample, group_name="group", 
+#   group_color=anno_col_list$sample_split_color,
+#   # panel size, gap, width, fill, color
+#   ggplot.panel.arg = c(2, 0.4, 4, "grey90","grey30"))
+
+# enrichment by cluster
+enrich_hallmark <- anno_cl_list$cl$cluster %>% split(., .) %>% 
+  modify(names) %>% enirch_ora_list(genesets["Hallmark"])
+plot_hallmark <- enrich_hallmark %>% map(
+  \(x) x@result %>% 
+    mutate(.,Description=factor(
+      Description, levels=rev(unique(.$Description)))) %>% 
+    filter(pvalue < 0.01) %>% 
+    slice_min(n=5, order_by=p.adjust) %>% 
+    ggplot(aes(-log10(p.adjust), Description)) + 
+    geom_col(aes(fill=-log10(p.adjust)), width=0.8, show.legend = F) +
+    geom_text(aes(x=0, label=Description), #size=2,
+              hjust=0, nudge_x=0.05, show.legend = F) +
+    # scale_y_discrete(labels=function(x) str_wrap(x, width=40)) +
+    scale_fill_gradient(low="#fee8c8", high="#ef6548") +
+    theme_bw(2) + labs(x="",y="") +
+    theme(axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          panel.grid = element_blank()) )
+# plot_hallmark[[1]]
+anno_hallmark <- anno_gglist(
+  align_to=anno_cl_list$align_to, gglist=plot_hallmark, 
+  # panel size, gap, width, fill, color
+  ggplot.panel.arg = c(2, 0.4, 6, "grey90","grey30"))
+
+# add row annotation together
+right_annotation = rowAnnotation(
+  gene=mark_gene, cluster=anno_cl_list$anno_cl, 
+  trend=anno_boxtrend, hallmark=anno_hallmark)
+```
+
+### display heatmap
+```{r}
+# options
+if("fastcluster" %in% installed.packages()) ht_opt$fast_hclust <- TRUE
+ht_opt$TITLE_PADDING = unit(c(4, 4), "points")
+ht_opt$message = FALSE
+
+# plot
+pdf(str_glue("{enrichment_dir}/{Sys.Date()}_deg_all_cluster.pdf"), 
+    width=16, height=10)
+set.seed(42)
+p <- Heatmap(
+  mat, name = " ",  border = T,
+  col = circlize::colorRamp2(c(-2.5, 0, 2.5), c("#2166ac", "white", "#b2182b")),
+  
+  cluster_columns = F,
+  column_split = anno_col_list$sample_split,
+  column_title = NULL,#unique(sample_split),
+  # column_title_gp = gpar(fontsize=6, fill=sample_split_color),
+  show_column_names = T, column_names_side = "bottom",
+  column_names_gp = gpar(fontsize=4),
+  column_names_rot = 45,
+  top_annotation = anno_col_list$anno_sample,
+  
+  row_split = anno_cl_list$cl$cluster,
+  row_title = "C%s",
+  row_title_gp = gpar(fontsize=8),
+  row_title_rot = 0,
+  row_title_side = "left",
+  right_annotation = right_annotation,
+  show_row_names = F,
+  row_names_gp = gpar(fontsize=4)) %>% 
+  draw(use_raster=T)
+# grid.newpage()
+# pushViewport(viewport(layout = grid.layout(nr = 1, nc = length(ks))))
+# for(i in seq_along(ht_list)) {
+#   pushViewport(viewport(layout.pos.row = 1, layout.pos.col = i))
+#   draw(ht_list[[i]], newpage = F)
+#   upViewport() }
+while(dev.cur() != 1) dev.off()
+
+# save data
+row_ord <- enframe(row_order(p), "cluster", "row_order") %>% 
+  unnest(row_order)
+ht_cluster <- mat[row_ord$row_order, unlist(column_order(p))] %>% 
+  round(3) %>% 
+  cbind(cluster=row_ord$cluster, .) %>% 
+  as_tibble(rownames="symbol")
+export(ht_cluster, str_glue(
+  "{enrichment_dir}/{Sys.Date()}_deg_all_cluster.xlsx"))
+```
+
+
+## ORA (pairwise)
+### enrichment
+```{r}
+enrich_result_ora <- enrich_ora_list(wald_test_sig, genesets)
+
+# save data
+export(map(enrich_result_ora, \(x) as_tibble(x@result)), 
+           str_glue("{enrichment_dir}/{Sys.Date()}_enrichment_ora.xlsx"))
+# save plot
+n_col <- length(enrich_result_ora) #if_else( > 1, 2, 1)
+map(enrich_result_ora, 
+    \(x) plot_enrich_ora(x@result, facet_by="Category")) %>%
+  plot_grid(plotlist = ., 
+            labels = names(enrich_result_ora), 
+            ncol = n_col, 
+            axis = "tblr", align = "hv", 
+            label_size = 8, scale = 0.9) %>% 
+  ggsave(str_glue("{enrichment_dir}/{Sys.Date()}_enrichment_ora.pdf"),
+          .,
+          width=n_col*6, 
+          height=length(genesets)*4, 
+          limitsize = F)
+```
+
+### visNetwork
+```{r}
+pvalue_cutoff <- 1e-3
+min_cluster_size <- 3
+plist <- list()
+
+for(x in names(enrich_result_ora)) {
+  print(str_glue("visNetwork >>> {x}"))
+  plist[[x]] <- enrich_result_ora[[x]]@result %>% 
+    filter(pvalue < pvalue_cutoff) %>% 
+    aPEAR::enrichmentNetwork(
+      simMethod = "jaccard", # c('jaccard', 'cosine', 'cor'),
+      clustMethod = "markov", # c('markov', 'hier', 'spectral'),
+      clustNameMethod = "pagerank", # c('pagerank', 'hits', 'none'),
+      minClusterSize = min_cluster_size, # min number of nodes in a single cluster
+      colorBy = "pvalue", # pvalue, NES
+      colorType = "pval", # use log transform on the colorBy column and adjust color range
+      nodeSize = "Count",
+      innerCutoff = 0.1, # similarity cutoff for in-cluster nodes
+      outerCutoff = 0.5, # similarity cutoff for between-cluster nodes
+      pCutoff = -5, # adjust p-value colouring cutoff when using pval
+      drawEllipses = T,
+      fontSize = 5,
+      repelLabels = T,
+      plotOnly = T,
+      verbose = F)
+}
+
+# save plot
+plot_grid(plotlist = plist, 
+          labels = names(enrich_result_ora), 
+          ncol = 1, 
+          axis = "tblr", align = "hv", 
+          label_size = 8, scale = 0.9) %>% 
+  ggsave(str_glue(
+    "{enrichment_dir}/{Sys.Date()}_enrichment_ora_visNetwork.pdf"),
+    .,
+    width=10, 
+    height=length(enrich_result_ora)*10, 
+    limitsize = F)
+```
+
+
+## GSEA (pairwise)
+### enrichment
+```{r}
+enrich_result_gsea <- enrich_gsea_list(genelist_ranked, genesets)
+
+# save data
+export(map(enrich_result_gsea, \(x) as_tibble(x@result)), 
+       str_glue("{enrichment_dir}/{Sys.Date()}_enrichment_gsea.xlsx"))
+# save plot
+n_col <- length(enrich_result_gsea) #if_else( > 1, 2, 1)
+map(enrich_result_gsea, 
+    \(x) plot_enrich_gsea(x@result, facet_by="Category")) %>%
+  plot_grid(plotlist = ., 
+            labels = names(enrich_result_gsea), 
+            ncol = n_col, 
+            axis = "tblr", align = "hv", 
+            label_size = 8, scale = 0.9) %>% 
+  ggsave(str_glue("{enrichment_dir}/{Sys.Date()}_enrichment_gsea.pdf"),
+          .,
+          width=n_col*6, 
+          height=length(genesets)*4, 
+          limitsize = F)
+```
+
+### visNetwork
+```{r}
+pvalue_cutoff <- 1e-3
+min_cluster_size <- 4
+plist <- list()
+
+for(x in names(enrich_result_gsea)) {
+  print(str_glue("visNetwork >>> {x}"))
+  plist[[x]] <- enrich_result_gsea[[x]]@result %>% 
+    filter(pvalue < pvalue_cutoff) %>% 
+    aPEAR::enrichmentNetwork(
+      simMethod = "jaccard", # c('jaccard', 'cosine', 'cor'),
+      clustMethod = "markov", # c('markov', 'hier', 'spectral'),
+      clustNameMethod = "pagerank", # c('pagerank', 'hits', 'none'),
+      minClusterSize = min_cluster_size, # min number of nodes in a single cluster
+      colorBy = "NES", # pvalue, NES
+      colorType = "nes", # use log transform on the colorBy column and adjust color range
+      nodeSize = "setSize",
+      innerCutoff = 0.1, # similarity cutoff for in-cluster nodes
+      outerCutoff = 0.5, # similarity cutoff for between-cluster nodes
+      pCutoff = -5, # adjust p-value colouring cutoff when using pval
+      drawEllipses = F,
+      fontSize = 4,
+      repelLabels = F,
+      plotOnly = T,
+      verbose = F)
+}
+
+# save plot
+plot_grid(plotlist = plist, 
+          labels = names(enrich_result_gsea), 
+          ncol = 1, 
+          axis = "tblr", align = "hv", 
+          label_size = 8, scale = 0.9) %>% 
+  ggsave(str_glue(
+    "{enrichment_dir}/{Sys.Date()}_enrichment_gesa_visNetwork.pdf"),
+    .,
+    width=10, 
+    height=length(enrich_result_gsea)*10, 
+    limitsize = F)
+```
+
+
+### compare gseaplot
+```{r}
+source("~/Documents/GitHub/myScript/R_functions/helper.R")
+
+items <- c(
+  "HALLMARK_MYC_TARGETS_V1",
+  "HALLMARK_MYC_TARGETS_V2"
+  # "HALLMARK_myc_core_plos_one",
+  # "HALLMARK_myc_core_nsmb"
+)
+
+for(idx in seq_along(enrich_result_gsea)) {
+  # library(patchwork)
+  subset <- enrich_result_gsea[[idx]]
+  print(names(enrich_result_gsea)[idx])
+  pdf(str_glue('{enrichment_dir}/{Sys.Date()}_{names(enrich_result_gsea)[idx]}.pdf'), 
+      width=5, height=3.5)
+  for(item in items) {
+    stat <- subset@result[subset@result$ID==item, c("NES","p.adjust")] %>% 
+      mutate(NES=round(NES, 2)) %>% 
+      as.numeric()
+    # scales::label_number_auto()
+    npcx <- ifelse(stat[1] > 0, 0.95, 0.05)
+    npcy <- ifelse(stat[1] > 0, 0.95, 0.05)
+    anno <- format_num_auto(stat) %>%  str_c(c("NES: ","p.adjust: "), ., collapse="\n")
+    p <- gseaplot(subset, geneSetID=item, title=item, 
+                  color="grey50", color.line="steelblue", by="runningScore") +
+      ggpp::annotate("text_npc", label=anno, size=5, npcx=npcx, npcy = npcy) +
+      theme(panel.grid=element_blank())
+    # p <- gseaplot2(subset, geneSetID=item, title=item)
+    print(p)
+  }
+  while(dev.cur() != 1) dev.off()
+}
+
+
+compare_list <- list(
+  c("Kelly.40nM.1h_vs_Kelly.0nM.16", "SHEP.40nM.1h_vs_SHEP.0nM.16h"),
+  c("Kelly.40nM.4h_vs_Kelly.0nM.16", "SHEP.40nM.4h_vs_SHEP.0nM.16h"),
+  c("Kelly.40nM.16h_vs_Kelly.0nM.1", "SHEP.40nM.16h_vs_SHEP.0nM.16h"),
+  c("Kelly.200nM.1h_vs_Kelly.0nM.1", "SHEP.200nM.1h_vs_SHEP.0nM.16h"),
+  c("Kelly.200nM.4h_vs_Kelly.0nM.1", "SHEP.200nM.4h_vs_SHEP.0nM.16h"),
+  c("Kelly.200nM.16h_vs_Kelly.0nM.", "SHEP.200nM.16h_vs_SHEP.0nM.16")
+)
+
+for(compare in compare_list) {
+  # subsets <- enrich_result_gsea[compare[1]]
+  print(str_c(str_replace_all(compare, "_vs_.*$", ""), collapse="__"))
+  f_name <- str_glue(
+    '{enrichment_dir}/{Sys.Date()}_compare_{str_c(str_replace_all(compare, "_vs_.*$", ""), collapse="__")}.pdf')
+  
+  pdf(f_name, width=4, height=1.5*length(items))
+  for(item in items) {
+    # item <- "HALLMARK_MYC_TARGETS_V2"
+    gsdata <-  enrich_result_gsea[compare] %>% 
+      map(\(x) enrichplot:::gsInfo(x, item)) %>% 
+      list_rbind(names_to="sample") %>% 
+      as_tibble()
+    i <- 0
+    for (term in unique(gsdata$Description)) {
+      idx <- which(gsdata$ymin != 0 & gsdata$Description == term)
+      gsdata[idx, "ymin"] <- i
+      gsdata[idx, "ymax"] <- i + 1
+      i <- i + 1
+    }
+    
+    p1 <- ggplot(gsdata, aes(x, runningScore, group=sample, color=sample)) + 
+      geom_hline(yintercept=0, linetype=2, linewidth=1, color="grey50") +
+      geom_line(linewidth = 1.2) +
+      scale_x_continuous(expand = c(0, 0)) +
+      xlab(NULL) + ylab("Running Enrichment Score") + 
+      ggtitle(item) +
+      theme_classic(8) + 
+      theme(panel.grid =element_blank(), 
+            legend.position = c(0.8, 0.8), 
+            legend.title = element_blank(), 
+            legend.background = element_rect(fill = "transparent"))
+    p2 <- ggplot(gsdata, aes(x)) + 
+      geom_linerange(aes(ymin = ymin, ymax = ymax, color = sample), show.legend=F) + 
+      xlab(NULL) + ylab(NULL) +
+      scale_x_continuous(expand = c(0,0)) +
+      scale_y_continuous(expand = c(0, 0)) +
+      facet_wrap(~ sample, ncol=1, strip.position="top") +
+      theme_bw(8) +
+      theme(panel.grid =element_blank(), 
+            strip.text = element_blank(),
+            axis.ticks = element_blank(), 
+            axis.text = element_blank())
+    p2 <- ggrastr::rasterize(p2, dpi=300)
+    
+    p <- p1 + p2 + plot_layout(ncol=1, heights=c(3, 1))
+    
+    print(p)
+  }
+  while(dev.cur() != 1) dev.off()
+}
+
+```
+
+
+## KEGG pathview
+```{r}
+# save multiple comparison KEGG pathview
+if(!dir.exists(file.path(enrichment_dir, "KEGG_pathview"))) 
+  dir.create(file.path(enrichment_dir, "KEGG_pathview"))
+
+# setwd (only works in this chunk)
+setwd(file.path(enrichment_dir, "KEGG_pathview"))
+
+# construct cross-sample all degs logFC matrix
+wald_test_sig_all <- wald_test_sig %>% 
+  unlist() %>% unique()
+degs_fc_matrix <- map(wald_test, \(x) column_to_rownames(x, "symbol") %>%
+                        .[wald_test_sig_all, ] %>%
+                        pull(log2FoldChange)) %>%
+  bind_cols() %>%
+  as.data.frame(row.names = wald_test_sig_all)
+
+print("pathview multi sample ordered as:")
+print(str_c(seq_along(colnames(degs_fc_matrix)), 
+            colnames(degs_fc_matrix), sep = ": "), sep = "\n")
+
+# show top N KEGG pathways in each comparison
+top_kegg <- map(enrich_result_gsea, 
+                \(x) dplyr::filter(x@result, Category=="KEGG") %>% 
+                  dplyr::slice_min(pvalue, n = 10) %>% 
+                  pull(ID)) %>%
+  unlist() %>% unique()
+
+kegg_species <- if_else(species == "hs", "hsa", "mmu")
+org_db <- if_else(species == "hs", "org.Hs.eg.db", "org.Mm.eg.db")
+
+# pdf
+pathview(gene.data = degs_fc_matrix, 
+         gene.idtype = "SYMBOL", 
+         pathway.id = top_kegg,
+         kegg.dir = ".", 
+         species = kegg_species, 
+         gene.annotpkg = org_db,
+         kegg.native = FALSE,
+         limit = list(gene = quantile(as.matrix(degs_fc_matrix), 
+                                      probs = c(0.02, 0.98))),
+         low = list(gene = "#377eb8"), 
+         mid = list(gene = "white"), 
+         high = list(gene = "#e41a1c"))
+
+```
+
+
+
+# Sample Based
+## ssGSEA with Hallmark
+```{r}
+# run many algorithms
+gsvapar <- gsvaParam(expr_mat_filtered, genesets$Hallmark)
+gsva_res <- GSVA::gsva(gsvapar)
+pheatmap(
+  gsva_res, border_color=NA, scale='none', 
+  cluster_cols = F,
+  cluster_rows = T,
+  fontsize_row = 6,
+  fontsize_col = 4,
+  filename=str_glue(
+    "{enrichment_dir}/{Sys.Date()}_ssGSEA_heatmap_gsva.pdf"),
+  width=6, height=7
+)
+while(dev.cur() != 1) dev.off()
+```
+
+## decouple network
+```{r}
+# pathway
+pathway_progeny <-
+  # decoupleR::get_progeny(organism, top = 500) %>%
+  {if(params$species=="hs") {
+    progeny::model_human_full 
+  } else {
+    progeny::model_mouse_full
+  }} %>% 
+  as_tibble() %>%
+  arrange(pathway, p.value) %>%
+  filter(p.value < 0.001) %>% 
+  # dplyr::slice_head(n=500, by=pathway) %>%
+  dplyr::select(source=pathway, 
+                target=gene, 
+                mor=weight, 
+                p_value=p.value) %>%
+  mutate(across(where(is.factor), as.character))
+# pathway_progeny <- get_progeny(organism, top=500) %>%
+#   rename(mor=weight)
+
+# TF regulon
+tf_collectri <- ifelse(params$species=='hs', 'human', 'mouse') %>% 
+  decoupleR::get_collectri(split_complexes=F)
+
+```
+
+## decouple analysis
+```{r}
+# run pathway
+pathway_res <- decouple(expr_mat_filtered, pathway_progeny)
+pathway_res$statistic %>% unique()
+
+# run TF
+tf_res <- decouple(expr_mat_filtered, tf_collectri)
+
+
+# save data
+write_xlsx(
+  list(progeny = pathway_res, collectri = tf_res),
+  str_glue("{enrichment_dir}/{Sys.Date()}_activity.xlsx"))
+
+```
+
+## decouple visualize
+```{r}
+pathway_res$statistic %>% unique()
+method_use <- "consensus"
+
+# pathway
+# barplot
+pathway_res %>%
+  left_join(sample, by=join_by(condition==sample_name)) %>%
+  # average sample score
+  summarise(score=mean(score),
+            .by=c(statistic, source, group)) %>%
+  # filter(statistic=='consensus') %>%
+  ggplot(aes(source, score, fill=group)) +
+  # geom_jitter() +
+  geom_col(width=0.7, color=NA, position=position_dodge2()) +
+  facet_wrap(~ statistic, scales='free') +
+  labs(x="") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        legend.position='top',
+        panel.grid = element_blank(),
+        strip.background = element_rect(fill=NA))
+ggsave(str_glue(
+  "{enrichment_dir}/{Sys.Date()}_activity_progeny_barplot.pdf"), 
+  width=12, height=6)
+
+# heatmap
+pathway_res_mat <- pathway_res %>%
+  filter(statistic == method_use) %>%
+  pivot_wider(id_cols = 'condition', 
+              names_from = 'source',
+              values_from = 'score') %>%
+  column_to_rownames('condition') %>%
+  as.matrix() %>% 
+  scale() %>% 
+  t() %>% 
+  # reorder
+  .[, sample$sample_name]
+# colnames(pathway_res_mat)
+# pathway_res_mat[1:5,1:2]
+pheatmap(pathway_res_mat, 
+         border_color = NA, 
+         color=colorRampPalette(c("#377eb8", "#f7f7f7", "#e41a1c"))(100),
+         cluster_rows = T,
+         cluster_cols = F,
+         annotation_col = column_to_rownames(sample[, -2], "sample_name"),
+         filename = str_glue(
+           "{enrichment_dir}/{Sys.Date()}_activity_progeny_heatmap.pdf"),
+         width = ceiling(nrow(pathway_res_mat)/2), 
+         height = ceiling(nrow(pathway_res_mat)/3),
+         main = str_glue("Heatmap of pathway activity")
+         )
+while(dev.cur() != 1) dev.off()
+
+
+
+
+# # TF
+# # barplot
+# tf_res_5 <- tf_res %>%
+#   left_join(sample, by=join_by(condition==sample_name)) %>%
+#   reframe(score=mean(score), 
+#           p_value=mean(p_value, na.rm=T), 
+#           .by=c(statistic, source, group)) %>%
+#   reframe(var=var(score), 
+#           .by=c(statistic, source)) %>%
+#   slice_max(order_by=abs(var), n=200, with_ties = F)
+# 
+# tf_res_25 <- tf_res %>%
+#   arrange(source) %>% 
+#   left_join(sample, by=join_by(condition==sample_name)) %>%
+#   reframe(score=mean(score),
+#           p_value=mean(p_value, na.rm=T),
+#           .by=c(statistic, source, group)) %>%
+#   reframe(var=var(score), .by=c(statistic, source)) %>%
+#   slice_max(order_by=abs(var), n=5, by=c(statistic))
+# tf_res %>% 
+#   left_join(sample, by=join_by(condition==sample_name)) %>%
+#   filter(source %in% tf_res_25$source) %>% 
+#   reframe(score=mean(score), 
+#           p_value=mean(p_value, na.rm=T), 
+#           .by=c(statistic, source, group)) %>% 
+#   ggplot(aes(source, score, fill=group)) +
+#   geom_col(width=0.7, color=NA, position=position_dodge2()) +
+#   facet_wrap(~ statistic, scales='free') +
+#   labs(x="") +
+#   theme_bw() +
+#   theme(axis.text.x=element_text(size=6, angle=45, hjust=1),
+#         legend.position='top',
+#         panel.grid = element_blank(),
+#         strip.background = element_rect(fill=NA))
+# ggsave(str_glue(
+#   "{enrichment_dir}/{Sys.Date()}_activity_collectri_barplot.pdf"),
+#   width=12, height=6)
+
+# heatmap
+tf_res_100 <- tf_res %>%
+  filter(statistic == method_use) %>%
+  left_join(sample, by=join_by(condition==sample_name)) %>%
+  reframe(score=mean(score), 
+          p_value=mean(p_value, na.rm=T), 
+          .by=c(statistic, source, group)) %>%
+  reframe(var=var(score), 
+          .by=c(statistic, source)) %>%
+  slice_max(order_by=abs(var), n=200, with_ties = F)
+tf_res_mat <- tf_res %>%
+  filter(statistic == method_use) %>%
+  # filter(source %in% tf_res_100$source) %>%
+  pivot_wider(id_cols = 'condition', 
+              names_from = 'source',
+              values_from = 'score') %>%
+  column_to_rownames('condition') %>%
+  as.matrix() %>% 
+  scale() %>% 
+  t() %>% 
+  # reorder
+  .[, sample$sample_name]
+# dim(tf_res_mat)
+# tf_res_mat[1:5,1:2]
+pheatmap(tf_res_mat, 
+         border_color = NA, 
+         color=colorRampPalette(c("#377eb8", "#f7f7f7", "#e41a1c"))(100),
+         cluster_rows = T,
+         cluster_cols = F,
+         show_rownames = F,
+         fontsize_row = 3,
+         annotation_col = column_to_rownames(sample[, -2], "sample_name"),
+         filename = str_glue(
+           "{enrichment_dir}/{Sys.Date()}_activity_collectri_heatmap.pdf"),
+         width = ceiling(nrow(pathway_res_mat)/2), 
+         height = ceiling(nrow(pathway_res_mat)/2),
+         main = str_glue("Heatmap of TFs activity")
+         )
+while(dev.cur() != 1) dev.off()
+
+```
+
+## individual pathway
+```{r}
+# define pathway of interest
+poi <- "MAPK"
+label_genes <- c("EPHA2","SPRY4","DUSP6","CCND1")
+# label_genes <- NULL
+
+# read deg results
+wald_test_file <- list.files(deseq2_dir, 
+                             wald_test_suffix,
+                             full.names = T) %>% 
+  str_subset("^[^~]") %>% 
+  last()
+comparison <- excel_sheets(wald_test_file)
+cat(str_glue("{str_c(comparison, collapse='\n')}"))
+wald_test_deg_in_poi <- comparison %>% 
+  set_names(comparison) %>% 
+  map(\(x) read_xlsx(wald_test_file, x) %>% 
+        # order by stats first
+        arrange(desc(stat), pvalue) %>% 
+        filter(baseMean > 500, 
+               abs(log2FoldChange) > deg_fc,
+               padj < deg_padj) %>% 
+        inner_join(
+          filter(pathway_progeny, source == poi, p_value < 0.001),
+          by=join_by(symbol==target)) %>% 
+        {if(is.null(label_genes)) {.} else{
+            mutate(., label=if_else(symbol %in% label_genes, symbol, NA))
+          } } %>%
+        mutate(label=ifelse(mor>1 & abs(stat)>2, symbol, NA)) %>% 
+        mutate(type=case_when(mor > 0 & stat > 0 ~ "1",
+                              mor > 0 & stat < 0 ~ "2",
+                              mor < 0 & stat > 0 ~ "2",
+                              mor < 0 & stat < 0 ~ "1"))
+      )
+
+# plot each wald test group
+wald_test_deg_in_poi %>%
+  map(\(x) ggplot(x, aes(x = mor, y = stat, color = type)) + 
+        geom_point(size=0.5, alpha=0.7) +
+        # scale_colour_manual(values = c("red","royalblue3","grey")) +
+        # geom_label_repel(aes(label = ID)) + 
+        geom_text_repel(aes(label=label), size=2) +
+        labs(x="Weight",y="Wald test statistics") +
+        theme_minimal() +
+        theme(legend.position = "none") +
+        geom_vline(xintercept = 0, linetype = 'dotted') +
+        geom_hline(yintercept = 0, linetype = 'dotted')) %>% 
+  plot_grid(plotlist = ., labels = names(.), label_size = 8)
+
+ggsave(str_glue(
+  "{enrichment_dir}/{Sys.Date()}_activity_{poi}.pdf"), 
+  width=9, height=9)
+
+```
+
+
+
+
+
+
