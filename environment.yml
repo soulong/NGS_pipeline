@@ -2,7 +2,6 @@ name: ngs
 channels:
   - bioconda
   - conda-forge
-  - defaults
 dependencies:
   # Core bioinformatics tools
   - salmon>=1.9
@@ -18,7 +17,7 @@ dependencies:
   - mageck
   
   # R and Bioconductor
-  - r-base>=4.0
+  - r-base>=4.5
   - r-essentials
   - bioconductor-deseq2
   - bioconductor-edger
@@ -36,7 +35,7 @@ dependencies:
   - r-qqnorm
   
   # Python packages
-  - python>=3.8
+  - python>=3.10
   - pandas
   - numpy
   - matplotlib
@@ -49,7 +48,6 @@ dependencies:
   
   # Utilities
   - pip
-  - nextflow
   - yaml
   
   # Pip packages (if not available in conda)
