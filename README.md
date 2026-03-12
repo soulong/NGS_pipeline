@@ -55,13 +55,13 @@ git clone https://github.com/soulong/ngs_pipeline.git
 cd ngs_pipeline
 ```
 
-### 2. 创建 Conda 环境
+### 2. 创建 Conda 环境（推荐）
 ```bash
 conda env create -f environment.yml
 conda activate ngs
 ```
 
-### 3. 手动安装依赖
+### 3. 手动安装依赖（可选）
 ```bash
 # 核心工具
 conda install -c bioconda salmon star bowtie2 samtools bedtools
@@ -324,7 +324,7 @@ bash CutTag/run_cuttag.sh config.yml
 
 ## 📄 许可证
 
-MIT License
+本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
 
 ---
 
@@ -335,10 +335,9 @@ Pipeline organization by **soulong**
 
 ---
 
-## 📧 联系方式
+## 📄 许可证
 
-- GitHub: [@soulong](https://github.com/soulong)
-- Email: [添加联系邮箱]
+本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
 
 ---
 
