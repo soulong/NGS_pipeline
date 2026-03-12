@@ -19,6 +19,8 @@ params:
   wald_test_suffix: "_wald_result.xlsx" 
   expr_file_suffix: "_norm_expression.xlsx"
   quantification_dir: "quantification"
+  # pathway of interest for individual analysis
+  pathway_of_interest: ["HALLMARK_MYC_TARGETS_V1", "HALLMARK_MYC_TARGETS_V2"]
 --- 
 
 # Setup
@@ -145,7 +147,9 @@ if(!exists("genesets")) {
   ## subset genesets
   genesets <- list(
     ## H
-    # Hallmark = filter(msigdb, gs_cat == "H")
+    Hallmark = filter(msigdb, gs_cat == "H") %>%
+      select(gs_id=gs_exact_source, gs_name, gene_symbol) %>%
+      mutate(gs_id=ifelse(gs_id=="", gs_name, gs_id))
     ## GO
     # GOBP = filter(msigdb, gs_subcat == "GO:BP")
     # GOMF = filter(msigdb, gs_subcat == "GO:MF"),
@@ -183,10 +187,13 @@ if(!exists("genesets")) {
       bind_rows(yap_targets)
   }
   
-  # to list
-  genesets <- genesets %>% 
-    map(\(x) list(term2gene=x[, c("gs_id", "gene_symbol")],
-                  term2name=x[, c("gs_id", "gs_name")]))
+  # to list (Hallmark only by default)
+  genesets <- list(
+    Hallmark = list(
+      term2gene = genesets$Hallmark[, c("gs_id", "gene_symbol")],
+      term2name = genesets$Hallmark[, c("gs_id", "gs_name")]
+    )
+  )
 }
 ```
 
@@ -214,7 +221,7 @@ if(T) {
 ### mark gene
 ```{r}
 # mark gene
-pathway <- c("HALLMARK_MYC_TARGETS_V1","HALLMARK_MYC_TARGETS_V2")
+pathway <- params$pathway_of_interest
 mark_gene <- list_flatten(genesets) %>% 
   .[str_detect(names(.), "term2gene")] %>% 
   list_rbind() %>% 

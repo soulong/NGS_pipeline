@@ -17,6 +17,9 @@ params:
   deg_padj: 0.01
   deg_fc: 1.5
   deg_threshold: 2 # tpm threshold at least in one group for plot heatmmap
+  # comparisons: list of c("treatment", "control")
+  comparison:
+    - ["treatment", "control"]
 ---
 
 # Setup
@@ -59,29 +62,12 @@ options(rio.import.class='tbl')
 sample <- import(samplesheet)
 col_data <- sample[, 1:2] %>% column_to_rownames('sample') %>% print()
 
-# edit manually
-comparison <- list(c("3P51-3h", "DMSO"))
+# Define comparisons from params
+comparison <- params$comparison
 
 if(!all(list_c(comparison) %in% sample$group)) 
   stop('all comparison should be in group column!')
 
-```
-
-
-```{r}
-f <- 'quantification/2026-02-12_gene_expression.xlsx'
-x <- import(f, which='counts')
-
-ran <- rnorm(nrow(x), 1, sd=0.1)
-ran[ran < 0.2] <- 0.2
-x$`3P51-3h-2` <- x$`3P51-3h-1` * ran
-
-ran <- rnorm(nrow(x), 1, sd=0.1)
-ran[ran < 0.2] <- 0.2
-x$`DMSO-2` <- x$`DMSO-1` * ran
-
-y <- import(f, which='tpm')
-export(list(tpm=y, counts=x), f)
 ```
 
 
