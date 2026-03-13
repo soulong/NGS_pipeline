@@ -2,230 +2,346 @@
 library(tidyverse)
 library(GenomicRanges)
 library(ChIPseeker)
-library(chromVAR)
+library(GenomeInfoDb)
 library(EnrichedHeatmap)
+ht_opt$message = FALSE
 library(circlize)
 library(DESeq2)
+require(org.Hs.eg.db)
+require(TxDb.Hsapiens.UCSC.T2T-CHM13v2.knownGene)
+
+# load helper
+parent_path <- rstudioapi::getActiveDocumentContext()$path |> 
+  dirname()|> dirname()
+source(file.path(parent_path, 'ngs_helper.R'))
 
 
+data_dir <- norm_path(r"(E:\NGS\2026-01-08_CutTag_293T_ZTX\result)") %>% 
+  setwd()
 
-setwd('C:/Users/haohe/Desktop/CUTTAG/results')
-txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene::TxDb.Hsapiens.UCSC.hg38.knownGene
 annodb <- "org.Hs.eg.db"
 
+set_style <- function(x) { 
+  seqlevelsStyle(x) <- "UCSC"
+  x <- keepStandardChromosomes(x, pruning.mode="tidy")
+  return(x)
+  }
 
-
-## load peak -----
-# bam files
-bam_files <- '02_alignment/bowtie2/target/markdup' %>% 
-  list.files(pattern='.bam$', full.names=T) %>% 
-  set_names(., nm=map_chr(., basename)) %>% 
-  print()
-
-# bw files
-bw_files <- '03_peak_calling/03_bed_to_bigwig' %>% 
-  list.files(pattern='.bigWig$', full.names=T) %>% 
-  set_names(., nm=map_chr(., basename)) %>% 
-  print()
+# txdb <- TxDb.Hsapiens.UCSC.T2T-CHM13v2.knownGene::TxDb.Hsapiens.UCSC.T2T-CHM13v2.knownGene
+txdb_file <- 'F:/index/hs/chm13/chm13v2_clean.gtf'
+if(file.exists(txdb_file)) {
+  txdb <- read_rds(txdb_file)
+} else {
+  t2t_gtf <- norm_path(r"(F:\index\hs\chm13\chm13.draft_v2.0.gene_annotation.gff3.gz)")
   
-# peak files
-peak_files <- '03_peak_calling/04_called_peaks/macs2' %>% 
-  list.files(pattern='.broadPeak$', full.names=T) %>% 
-  set_names(., nm=map_chr(., basename)) %>% 
-  print()
-
-
-# import peaks
-peaks <- peak_files %>% 
-  map(rtracklayer::import) %>% 
-  GRangesList() %>% 
-  print()
-seqlevelsStyle(peaks) <- "UCSC"
-genome(peaks) <- "hg38"
-# print(standardChromosomes(peaks))
-
-# keep autosomes only
-peaks <- peaks %>% 
-  keepStandardChromosomes(pruning.mode="tidy")
-print(peaks[[1]]@seqnames)
-
-
-
-## consensus peak -----
-# get consensus peak
-consensus_peak <- peaks %>% 
-  GRangesList() %>% 
-  unlist() %>% 
-  GenomicRanges::reduce()
-
-# annotate consensus peak
-consensus_peak_anno <- consensus_peak %>% 
-  ChIPseeker::annotatePeak(tssRegion=c(-3000, 3000),
-                           TxDb=txdb, 
-                           level='gene',
-                           annoDb=annodb)
-consensus_peak <- consensus_peak_anno@anno
-
-# peak within TSS
-consensus_peak_within_tss <- 
-  (abs(consensus_peak$distanceToTSS) <= 3000) %>% 
-  consensus_peak[.]
-# rtracklayer::export(consensus_peak_within_tss, 'consensus_peak_within_tss.bed')
-
-
-
-
-## visualize TSS -----
-# check TSS
-tss <- getPromoters(TxDb=txdb, upstream=3000, downstream=3000)
-tss_hit <- findOverlaps(tss, consensus_peak, minoverlap=1000)
-tss_overlap_with_peak <- tss[unique(queryHits(tss_hit))]
-
-# mat <- normalizeToMatrix(peaks[[1]], 
-#                          tss_overlap_with_peak[1:100], 
-#                          extend = 3000,
-#                          value_column="score", 
-#                          mean_mode = "w0", 
-#                          w = 50,
-#                          keep = c(0, 0.99))
-# EnrichedHeatmap(mat)
-
-# loop over samples
-mat_list <- peaks %>% 
-  map(\(x) 
-      normalizeToMatrix(
-        signal=x, 
-        target=resize(tss_overlap_with_peak, width=1, fix="center"), 
-        extend=3000, 
-        value_column="score", 
-        mean_mode="w0", w=50, keep=c(0, 0.99)) )
-
-# set global scale bar
-all_values <- unlist(lapply(mat_list, function(m) as.vector(m)))
-global_min <- quantile(all_values, 0.01)
-global_max <- quantile(all_values, 0.99)
-col_fun <- colorRamp2(
-  breaks = c(global_min, global_max),
-  colors = c("white", "#a50026"))
-
-# set same ylim for top annotation
-all_ylim <- lapply(mat_list, function(mat) {
-  # Extract the mean enrichment profile for this sample
-  avg <- colMeans(mat, na.rm = TRUE)  # or colMeans if you used target_ratio
-  c(min(avg), max(avg))
-})
-global_ymin <- min(sapply(all_ylim, `[`, 1)) * 0
-global_ymax <- max(sapply(all_ylim, `[`, 2)) * 1.2
-# rebuild the top_annotation with fixed ylim
-fixed_anno <- HeatmapAnnotation(
-  lines = anno_enriched(
-    ylim = c(global_ymin, global_ymax),   # <-- THIS IS THE KEY
-    gp = gpar(col = "black", lwd = 2),
-    axis_param = list(
-      at = c(global_ymin, 0, global_ymax),
-      labels = c(round(global_ymin, 2), "0", round(global_ymax, 2)),
-      side = "left"
-    )),
-  height = unit(2, "cm")  # make taller for visibility
-)
-
-# cluster only once on the selected matrix
-row_ord <- mat_list[[13]] %>% 
-  EnrichedHeatmap() %>% 
-  row_order()
-
-# create heatmap over samples
-ht_list <- NULL
-for(i in seq_along(mat_list)) {
-  mat <- mat_list[[i]]
-  sample_name <- names(mat_list)[i] %>% 
-    str_split_1('[.]') %>% 
-    .[1]
+  gtf <- rtracklayer::import(t2t_gtf)
+  gtf_df <- as_tibble(gtf)
+  gtf_df_clean <- gtf_df %>% 
+    dplyr::select(seqnames:type, phase, 
+                  gene_biotype,
+                  gene_name, 
+                  gene_id=source_gene,
+                  transcript_biotype,
+                  transcript_name=source_transcript_name,
+                  transcript_id=source_transcript
+                  )
+  gtf_df_clean_gr <- gtf_df_clean %>% 
+    makeGRangesFromDataFrame(keep.extra.columns=T) %>% 
+    print()
+  clean_gtf_file <- 'F:/index/hs/chm13/chm13v2_clean.gtf'
+  rtracklayer::export(gtf_df_clean_gr, clean_gtf_file)
   
-  ht <- EnrichedHeatmap(
-    mat,
-    name = sample_name,
-    col = col_fun,
-    axis_name = c("-3kb", "TSS", "3kb"),
-    column_title = sample_name,
-    top_annotation = fixed_anno,
-    show_heatmap_legend = ifelse(i==1, T, F),
-    heatmap_legend_param = list(
-      title = "normalized",
-      legend_direction = "horizontal",
-      at = c(global_min, global_max),
-      labels = c(round(global_min, 2), round(global_max, 2))),
-    use_raster=TRUE
-  )
-  if(is.null(ht_list)) {
-    ht_list <- ht
-  } else ht_list <- ht_list + ht
+  txdb <- txdbmaker::makeTxDbFromGFF(clean_gtf_file)
+  seqlevelsStyle(txdb) <- 'UCSC'
+  # seqlevels(txdb)
+  write_rds(txdb, txdb_file)
 }
 
 
-# draw and save
-ht_opt$message = FALSE
-pdf("multi_sample_peak_heatmap_roword.pdf", width = 20, height = 8)
-draw(ht_list, 
-     row_order = row_ord,
-     # column_split = sample_groups,
-     # gap = unit(5, "mm"),
-     heatmap_legend_side = "bottom",
-     annotation_legend_side = "bottom",
-     padding = unit(c(10, 10, 10, 10), "mm"),
-     use_raster = TRUE)
-while(dev.cur() != 1) dev.off()
 
-pdf("multi_sample_peak_heatmap.pdf", width = 20, height = 8)
-draw(ht_list, 
-     row_order = NULL,
-     # column_split = sample_groups,
-     # gap = unit(5, "mm"),
-     heatmap_legend_side = "bottom",
-     annotation_legend_side = "bottom",
-     padding = unit(c(10, 10, 10, 10), "mm"),
-     use_raster = TRUE)
-while(dev.cur() != 1) dev.off()
+# prepare peak ------------------------------------------------
+
+## read peak ------------------------------------------------
+peak_suffix <- '.narrowPeak'
+peak_file <- '04_peaks' %>% 
+  list.files(pattern=peak_suffix, full.names=T) %>% 
+  set_names(., nm=map_chr(., \(x) basename(x) %>% 
+                            str_replace(fixed(peak_suffix),'') %>% 
+                            str_replace(fixed('_peaks'),''))) %>% 
+  print()
+
+# import 
+peak <- peak_file %>% 
+  map(rtracklayer::import) %>% 
+  GRangesList() %>% 
+  set_style() %>% 
+  print()
 
 
+### consensus ------------------------------------------------
+consensus <- peak %>% 
+  # subset samples
+  .[which(str_detect(names(.), 'TEAD'))] %>% 
+  # , group=names(.) %>% str_replace_all("_\\d","")
+  compute_consensus(., min_occurrence=2, min_gapwidth=1)
+
+consensus <- consensus$all
+
+# # annotate consensus
+# anno <- consensus %>% 
+#   ChIPseeker::annotatePeak(tssRegion=c(-3000, 3000),
+#                            TxDb=txdb, 
+#                            level='gene',
+#                            annoDb=annodb)
+# consensus <- anno@anno
+# # peak within TSS
+# consensus_within_tss <- 
+#   (abs(consensus$distanceToTSS) <= 3000) %>% 
+#   consensus_peak[.] %>% 
+#   print()
+# rtracklayer::export(consensus_peak_within_tss, 'consensus_peak_within_tss.bed')
+
+
+### tss overlap ------------------------------------------------
+# tss <- getPromoters(TxDb=txdb, upstream=3000, downstream=3000)
+# 
+# hit <- findOverlaps(tss, consensus, minoverlap=1000)
+# tss_overlap_with_consensus <- tss[unique(queryHits(hit))]
+# 
+# hit <- findOverlaps(consensus, tss, minoverlap=1000)
+# consensus_overlap_with_tss <- consensus[unique(queryHits(hit))]
 
 
 
-## DEG peak ----
-# count over bam files
-fragment_counts <- getCounts(bam_files, 
-                             format = "bam",
-                             consensus_peak_within_tss, 
-                             paired = TRUE, by_rg = FALSE)
-colnames(fragment_counts) <- colnames(fragment_counts) %>% 
-  str_replace_all('(.target.markdup).*','')
+## read bam ------------------------------------------------
+bam_suffix <- '.filtered.bam'
+bam_file <- '03_bam' %>% 
+  list.files(pattern=bam_suffix, full.names=T) %>%
+  str_subset(".bai", negate=T) %>% 
+  set_names(., nm=map_chr(., \(x) basename(x) %>% 
+                            str_replace(fixed(bam_suffix),''))) %>% 
+  # subset samples
+  .[which(str_detect(names(.), 'BRD4'))] %>% 
+  print()
 
-count_mat <- assay(fragment_counts)
-dim(count_mat)
-# remove low count genes
-selected_row <- which(rowSums(count_mat) > 10)
-count_mat_selected = count_mat[selected_row, ]
-dim(count_mat_selected)
+# # get count over bam
+# bam_count <- list()
+# for(f in bam_file) {
+#   # bam <- bam_file[idx]
+#   res <- compute_count(f, consensus, flank_size=0, mode="count")
+#   bam_count[[f]] <- res$count
+# }
+# count <- list_rbind(bam_count, names_to="group") %>% 
+#   as_tibble() %>% 
+#   unite('uid', seqnames:end) %>% 
+#   dplyr::select(uid, group, count_region) %>% 
+#   pivot_wider(id_cols=uid, 
+#               names_from=group, 
+#               names_prefix='03_bam/', 
+#               values_from=count_region) %>% 
+#   rename_with(\(x) str_replace_all(x, '03_bam/', '') %>% 
+#                 str_replace_all('.filtered.bam', '')) %>% 
+#   column_to_rownames("uid")
+# get count over bam
+bam_count <- chromVAR::getCounts(
+  bam_file, format = "bam", consensus,
+  paired = TRUE, by_rg = FALSE)
+count <- assay(bam_count, 'counts')
+rownames(count) <- as_tibble(consensus) %>% 
+  unite('uid', 1:3) %>% pull(uid)
+colnames(count) <- names(bam_file)
 
-col_data <- tibble(sample=colnames(fragment_counts),
-                   condition=c(rep('HU',3), rep('IMR', 6), rep('IMRJ009',6))) %>% 
-  column_to_rownames('sample') %>% 
+count[1:2,1:2]
+
+
+### deseq2 ------------------------------------------------
+col_data <- colnames(count) %>% 
+  tibble(sample=.) %>% 
+  mutate(group=sapply(strsplit(sample, "_"), `[`, 1)) %>% 
+  column_to_rownames("sample") %>% 
   print()
 
 dds <- DESeqDataSetFromMatrix(
-  countData = count_mat_selected,
-  colData = col_data, design = ~ condition)
-dds <- DESeq(dds)
-# count_norm <- counts(dds, normalized = TRUE)
-count_vst <- vst(dds, blind=FALSE)
+  count, col_data, design = ~ group) %>% 
+  DESeq()
+dds_result <- results(dds, contrast=c("group", "P62", "DMSO")) %>% 
+  as_tibble(rownames='uid') %>% 
+  arrange(pvalue) %>%
+  print()
+dds_result_sig <- dds_result %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  separate(uid, c("seqnames","start","end","width"), sep="_") %>% 
+  arrange(desc(log2FoldChange)) %>% 
+  print()
 
-pdf("DESeq2_pca.pdf", width=7, height=7)
-DESeq2::plotPCA(count_vst, "condition", ntop=2000) + 
-  ggrepel::geom_label_repel(aes(label=name), size=2, max.overlaps=20) +
-  theme_bw()
-while(dev.cur() != 1) dev.off()
+dds_result_sig_gr <- dds_result_sig %>% 
+  makeGRangesFromDataFrame(keep.extra.columns=T) %>% 
+  print()
+
+dds_result_sig_gr_anno <- dds_result_sig_gr %>%
+  ChIPseeker::annotatePeak(tssRegion=c(-3000, 3000),
+                           TxDb=txdb,
+                           level='gene',
+                           annoDb=annodb) %>% 
+  { .@anno } %>% 
+  # trim() %>% # fix out of genome range problem
+  print()
+# as_tibble(dds_result_sig_gr_anno) %>% view()
 
 
+
+## read bw ------------------------------------------------
+bw_suffix <- '.CPM.bw'
+bw_file <- '03_bam' %>% 
+  list.files(pattern=bw_suffix, full.names=T) %>% # bw
+  set_names(., nm=map_chr(., \(x) basename(x) %>% 
+                            str_replace(fixed(bw_suffix),''))) %>% 
+  # subset samples
+  .[which(str_detect(names(.), 'TEAD|BRD4'))] %>% 
+  print()
+
+# reorder as heatmap needs
+new_order <- names(bw_file)[order(factor(sapply(strsplit(names(bw_file), "_"), `[`, 2)))]
+bw_file <- bw_file[new_order]
+
+# read bw
+bw <- bw_file %>% 
+  map(rtracklayer::import) %>% 
+  GRangesList() %>% 
+  set_style() %>% 
+  print()
+
+
+
+
+# heatmap ------------------------------------------------
+
+# signal of interest
+soi <- bw %>% .[which(str_detect(names(.), 'TEAD|BRD4'))]
+rois <- list(
+  pos = dds_result_sig_gr_anno[
+    dds_result_sig_gr_anno$log2FoldChange > 0],
+  neg = dds_result_sig_gr_anno[
+    dds_result_sig_gr_anno$log2FoldChange < 0]
+)
+for(idx in seq_along(rois)) {
+  # region of interest
+  roi <- rois[[idx]]
+  # calculate mat over signal
+  mat_list <- compute_signal_matrix(
+    signal=soi, 
+    region=roi, 
+    mode='reference_point', reference_point="center",
+    bin_size=50, scale='none',
+    mean_mode="w0", w=50, keep=c(0, 0.99)
+  )
+  # plot
+  result <- heatmap_profile(mat_list,
+                            color_scales = c(0, NA), 
+                            colors = c("white", "#b12923"))
+  # save
+  f_name <- str_glue('consensus_tead_deg_brd4_{names(rois)[idx]}')
+  pdf(str_glue("{Sys.Date()}_heatmap_{f_name}.pdf"), 
+      width = length(result$heatmap)*1.6, height = 8)
+  print(result$heatmap)
+  while(dev.cur() != 1) dev.off()
+}
+
+
+
+
+# 
+# 
+# 
+# 
+# # calculate mat over signal
+# mat_list <- soi %>% 
+#   map(\(x) 
+#       normalizeToMatrix(
+#         signal=x, 
+#         target=resize(roi, width=1, fix=pos), 
+#         extend=3000, 
+#         value_column="score", 
+#         mean_mode="w0", w=50, keep=c(0, 0.99))
+#       )
+# 
+# p <- heatmap_profile(
+#   mat_list, roi, kmeans=2, return_granges=F)
+# 
+# # set global scale bar
+# all_values <- unlist(lapply(mat_list, function(m) as.vector(m)))
+# global_min <- quantile(all_values, 0.01)
+# global_max <- quantile(all_values, 0.99)
+# if(global_min < 0 & global_max > 0) {
+#   col_fun <- colorRamp2(
+#     breaks = c(global_min, 0, global_max),
+#     colors = c("#295072", "white", "#b12923"))
+# } else {
+#   col_fun <- colorRamp2(
+#     breaks = c(global_min, global_max),
+#     colors = c("white", "#a50026"))
+# }
+# 
+# # set same ylim for top annotation
+# all_ylim <- lapply(mat_list, function(mat) {
+#   # Extract the mean enrichment profile for this sample
+#   avg <- colMeans(mat, na.rm = TRUE)  # or colMeans if you used target_ratio
+#   c(min(avg), max(avg))
+# })
+# global_ymin <- min(sapply(all_ylim, `[`, 1)) * 0
+# global_ymax <- max(sapply(all_ylim, `[`, 2)) * 1.2
+# # rebuild the top_annotation with fixed ylim
+# fixed_anno <- HeatmapAnnotation(
+#   lines = anno_enriched(
+#     ylim = c(global_ymin, global_ymax),   # <-- THIS IS THE KEY
+#     gp = gpar(col = "black", lwd = 2),
+#     axis_param = list(
+#       at = c(global_ymin, 0, global_ymax),
+#       labels = c(round(global_ymin, 2), "0", round(global_ymax, 2)),
+#       side = "left"
+#     )),
+#   height = unit(2, "cm")  # make taller for visibility
+# )
+# # create heatmap over signal
+# ht_list <- NULL
+# for(i in seq_along(mat_list)) {
+#   mat <- mat_list[[i]]
+#   sample_name <- names(mat_list)[i] %>% 
+#     str_split_1('[.]') %>% 
+#     .[1]
+#   # plot
+#   ht <- EnrichedHeatmap(
+#     mat,
+#     name = sample_name,
+#     col = col_fun,
+#     axis_name = c("-3kb", "TSS", "3kb"),
+#     column_title = sample_name,
+#     top_annotation = fixed_anno,
+#     show_heatmap_legend = ifelse(i==1, T, F),
+#     heatmap_legend_param = list(
+#       title = "normalized",
+#       legend_direction = "horizontal",
+#       at = c(global_min, global_max),
+#       labels = c(round(global_min, 2), round(global_max, 2))),
+#     use_raster=TRUE
+#   )
+#   if(is.null(ht_list)) {
+#     ht_list <- ht
+#   } else ht_list <- ht_list + ht
+# }
+# 
+# # save plot
+# pdf(str_glue("{Sys.Date()}_heatmap_{vis_name}.pdf"), 
+#     width = length(ht_list)*1.6, height = 8)
+# draw(ht_list, 
+#      row_order = NULL,
+#      # column_split = sample_groups,
+#      # gap = unit(5, "mm"),
+#      heatmap_legend_side = "bottom",
+#      annotation_legend_side = "bottom",
+#      padding = unit(c(10, 10, 10, 10), "mm"),
+#      use_raster = TRUE)
+# while(dev.cur() != 1) dev.off()
 
 
 
