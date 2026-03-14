@@ -8,7 +8,6 @@ ht_opt$message = FALSE
 library(circlize)
 library(DESeq2)
 require(org.Hs.eg.db)
-require(TxDb.Hsapiens.UCSC.T2T-CHM13v2.knownGene)
 
 # load helper
 parent_path <- rstudioapi::getActiveDocumentContext()$path |> 
@@ -28,32 +27,33 @@ set_style <- function(x) {
   }
 
 # txdb <- TxDb.Hsapiens.UCSC.T2T-CHM13v2.knownGene::TxDb.Hsapiens.UCSC.T2T-CHM13v2.knownGene
-txdb_file <- 'F:/index/hs/chm13/chm13v2_clean.gtf'
+txdb_file <- 'F:/index/hs/chm13/t2t_chm13v2_txdb.rds'
 if(file.exists(txdb_file)) {
   txdb <- read_rds(txdb_file)
 } else {
-  t2t_gtf <- norm_path(r"(F:\index\hs\chm13\chm13.draft_v2.0.gene_annotation.gff3.gz)")
+  # t2t_gtf <- norm_path(r"(F:\index\hs\chm13\chm13.draft_v2.0.gene_annotation.gff3.gz)")
+  t2t_gtf <- norm_path(r"(F:\index\hs\chm13\hs1.ncbiRefSeq.gtf.gz)")
   
-  gtf <- rtracklayer::import(t2t_gtf)
-  gtf_df <- as_tibble(gtf)
-  gtf_df_clean <- gtf_df %>% 
-    dplyr::select(seqnames:type, phase, 
-                  gene_biotype,
-                  gene_name, 
-                  gene_id=source_gene,
-                  transcript_biotype,
-                  transcript_name=source_transcript_name,
-                  transcript_id=source_transcript
-                  )
-  gtf_df_clean_gr <- gtf_df_clean %>% 
-    makeGRangesFromDataFrame(keep.extra.columns=T) %>% 
-    print()
-  clean_gtf_file <- 'F:/index/hs/chm13/chm13v2_clean.gtf'
-  rtracklayer::export(gtf_df_clean_gr, clean_gtf_file)
+  # gtf <- rtracklayer::import(t2t_gtf)
+  # gtf_df <- as_tibble(gtf)
+  # gtf_df_clean <- gtf_df %>% 
+  #   dplyr::select(seqnames:type, phase, 
+  #                 gene_biotype,
+  #                 gene_name, 
+  #                 gene_id=source_gene,
+  #                 transcript_biotype,
+  #                 transcript_name=source_transcript_name,
+  #                 transcript_id=source_transcript
+  #                 )
+  # gtf_df_clean_gr <- gtf_df_clean %>% 
+  #   makeGRangesFromDataFrame(keep.extra.columns=T) %>% 
+  #   print()
+  # clean_gtf_file <- 'F:/index/hs/chm13/chm13v2_clean.gtf'
+  # rtracklayer::export(gtf_df_clean_gr, clean_gtf_file)
   
-  txdb <- txdbmaker::makeTxDbFromGFF(clean_gtf_file)
+  txdb <- txdbmaker::makeTxDbFromGFF(t2t_gtf)
   seqlevelsStyle(txdb) <- 'UCSC'
-  # seqlevels(txdb)
+  seqlevels(txdb)
   write_rds(txdb, txdb_file)
 }
 
@@ -86,11 +86,13 @@ consensus <- peak %>%
   compute_consensus(., min_occurrence=2, min_gapwidth=1)
 
 consensus <- consensus$all
+# remove small fragment
+consensus <- consensus[width(consensus) > 20]
 
 # # annotate consensus
-# anno <- consensus %>% 
+# anno <- consensus %>%
 #   ChIPseeker::annotatePeak(tssRegion=c(-3000, 3000),
-#                            TxDb=txdb, 
+#                            TxDb=txdb,
 #                            level='gene',
 #                            annoDb=annodb)
 # consensus <- anno@anno
@@ -155,30 +157,25 @@ count[1:2,1:2]
 
 
 ### deseq2 ------------------------------------------------
+# coldata
 col_data <- colnames(count) %>% 
   tibble(sample=.) %>% 
   mutate(group=sapply(strsplit(sample, "_"), `[`, 1)) %>% 
   column_to_rownames("sample") %>% 
   print()
-
+# deseq2
 dds <- DESeqDataSetFromMatrix(
   count, col_data, design = ~ group) %>% 
   DESeq()
 dds_result <- results(dds, contrast=c("group", "P62", "DMSO")) %>% 
   as_tibble(rownames='uid') %>% 
-  arrange(pvalue) %>%
-  print()
-dds_result_sig <- dds_result %>% 
-  dplyr::filter(padj < 0.05) %>% 
   separate(uid, c("seqnames","start","end","width"), sep="_") %>% 
-  arrange(desc(log2FoldChange)) %>% 
+  arrange(pvalue) %>% 
   print()
 
-dds_result_sig_gr <- dds_result_sig %>% 
-  makeGRangesFromDataFrame(keep.extra.columns=T) %>% 
-  print()
-
-dds_result_sig_gr_anno <- dds_result_sig_gr %>%
+# anno deg
+dds_result_gr_anno <- dds_result %>% 
+  makeGRangesFromDataFrame(keep.extra.columns=T) %>%
   ChIPseeker::annotatePeak(tssRegion=c(-3000, 3000),
                            TxDb=txdb,
                            level='gene',
@@ -186,7 +183,39 @@ dds_result_sig_gr_anno <- dds_result_sig_gr %>%
   { .@anno } %>% 
   # trim() %>% # fix out of genome range problem
   print()
-# as_tibble(dds_result_sig_gr_anno) %>% view()
+
+# tidy deg
+yap_targets <- c(
+  "CTGF","CCN2","ANKRD1","CYR61","CCN1","TOP2A","KIF14","CCNA2",
+  "CDCA8","CENPF","KIF23","KIF20B","KNTC1","RRM2",
+  "MCM3","SGOL1.AS1","TUBB","MYBL1","RAD18",
+  "ZWILCH","SGOL1","TIMELESS","GINS1","SMC3","TK1",
+  "MRE11A","MCM7","SUV39H2","GADD45B","FOSL1","CENPV",
+  "RUVBL2","MYC","GLI2","AXL","ABCB1","CAT","GPATCH4",
+  "LMNB2","TXN","WSB2","AREG","FOXF2","IGFBP3","RASSF2",
+  "AMOTL2","NPPB","CCND1")
+deg_tidy <- as_tibble(dds_result_gr_anno) %>% 
+  janitor::clean_names() %>% 
+  mutate(yap_targets=ifelse(gene_id %in% yap_targets, gene_id, NA)) %>% 
+  mutate(type=ifelse(
+    log2fold_change > log2(1.5) & padj < 0.05, 'pos',
+    ifelse(log2fold_change < log2(1/1.5) & padj < 0.05, 'neg', NA))) %>% 
+  mutate(label=ifelse(!is.na(yap_targets) & type %in% 'pos', yap_targets, NA)) %>% 
+  glimpse()
+# save
+writexl::write_xlsx(
+  deg_tidy, str_glue('{Sys.Date()}_valcano_consensus_tead_deseq2_deg.xlsx'))
+
+# valcono
+p <- deg_tidy %>% 
+  ggplot(aes(log2fold_change, -log10(pvalue))) +
+  geom_point(aes(color=type), alpha=0.7, show.legend=F) +
+  scale_color_discrete(direction = -1) +
+  ggrepel::geom_text_repel(aes(label=label), size=5, show.legend=F) +
+  theme_bw()
+p <- ggrastr::rasterize(p, dpi=600)
+ggsave(str_glue('{Sys.Date()}_valcano_consensus_tead_deseq2_deg.pdf'),
+       p, width=5, height=5)
 
 
 
@@ -218,12 +247,11 @@ bw <- bw_file %>%
 
 # signal of interest
 soi <- bw %>% .[which(str_detect(names(.), 'TEAD|BRD4'))]
-rois <- list(
-  pos = dds_result_sig_gr_anno[
-    dds_result_sig_gr_anno$log2FoldChange > 0],
-  neg = dds_result_sig_gr_anno[
-    dds_result_sig_gr_anno$log2FoldChange < 0]
-)
+rois <- dplyr::filter(deg_tidy, !is.na(type)) %>% 
+  split(., .[['type']]) %>% 
+  map(\(x) makeGRangesFromDataFrame(x, keep.extra.columns=T)) %>% 
+  print()
+  
 for(idx in seq_along(rois)) {
   # region of interest
   roi <- rois[[idx]]
@@ -232,15 +260,14 @@ for(idx in seq_along(rois)) {
     signal=soi, 
     region=roi, 
     mode='reference_point', reference_point="center",
-    bin_size=50, scale='none',
-    mean_mode="w0", w=50, keep=c(0, 0.99)
+    bin_size=50, scale='none'
   )
   # plot
   result <- heatmap_profile(mat_list,
                             color_scales = c(0, NA), 
                             colors = c("white", "#b12923"))
   # save
-  f_name <- str_glue('consensus_tead_deg_brd4_{names(rois)[idx]}')
+  f_name <- str_glue('consensus_tead_and_deg_{names(rois)[idx]}')
   pdf(str_glue("{Sys.Date()}_heatmap_{f_name}.pdf"), 
       width = length(result$heatmap)*1.6, height = 8)
   print(result$heatmap)

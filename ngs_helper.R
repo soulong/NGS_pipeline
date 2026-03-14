@@ -213,6 +213,7 @@ compute_consensus <- function(
 #'
 #' This function calculates read counts and coverage for genomic regions
 #' and optionally their left/right flanking regions from BAM files.
+#' if only want to counts, use chromVAR::getCounts()
 #'
 #' @param bam_path Path to BAM file (with .bai index)
 #' @param gr GRanges object with genomic regions
@@ -435,7 +436,8 @@ compute_signal_matrix <- function(
         value_column = "score",
         extend = c(upstream, downstream),
         mean_mode = "w0",
-        w = bin_size,
+        w = bin_size, 
+        keep=c(0, 0.99),
         ...
       )
       return(mat)
@@ -678,7 +680,7 @@ heatmap_profile <- function(
     max_limit <- quantile(all_vals, 0.99, na.rm = TRUE)
     ylim_shared <- c(min_limit - abs(min_limit) * 0.1, max_limit * 1.2)
   }
-  print(ylim_shared)
+  # print(ylim_shared)
   
   if (is.null(color_scales[1]) || is.na(color_scales[1])) {
     color_scales[1] <- quantile(all_vals, 0.01, na.rm = TRUE)
