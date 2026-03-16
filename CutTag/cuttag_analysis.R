@@ -29,7 +29,7 @@ set_style <- function(x) {
 # txdb <- TxDb.Hsapiens.UCSC.T2T-CHM13v2.knownGene::TxDb.Hsapiens.UCSC.T2T-CHM13v2.knownGene
 txdb_file <- 'F:/index/hs/chm13/t2t_chm13v2_txdb.sqlite'
 if(file.exists(txdb_file)) {
-  txdb <- rio::import(txdb_file)
+  txdb <- AnnotationDbi::loadDb(txdb_file)
 } else {
   # t2t_gtf <- norm_path(r"(F:\index\hs\chm13\chm13.draft_v2.0.gene_annotation.gff3.gz)")
   t2t_gtf <- norm_path(r"(F:\index\hs\chm13\hs1.ncbiRefSeq.gtf.gz)")
@@ -54,7 +54,7 @@ if(file.exists(txdb_file)) {
   txdb <- txdbmaker::makeTxDbFromGFF(t2t_gtf)
   seqlevelsStyle(txdb) <- 'UCSC'
   seqlevels(txdb)
-  rio::export(txdb, txdb_file)
+  AnnotationDbi::saveDb(txdb, txdb_file)
 }
 
 # geneset
