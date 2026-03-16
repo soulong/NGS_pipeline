@@ -27,9 +27,9 @@ set_style <- function(x) {
   }
 
 # txdb <- TxDb.Hsapiens.UCSC.T2T-CHM13v2.knownGene::TxDb.Hsapiens.UCSC.T2T-CHM13v2.knownGene
-txdb_file <- 'F:/index/hs/chm13/t2t_chm13v2_txdb.rds'
+txdb_file <- 'F:/index/hs/chm13/t2t_chm13v2_txdb.sqlite'
 if(file.exists(txdb_file)) {
-  txdb <- read_rds(txdb_file)
+  txdb <- rio::import(txdb_file)
 } else {
   # t2t_gtf <- norm_path(r"(F:\index\hs\chm13\chm13.draft_v2.0.gene_annotation.gff3.gz)")
   t2t_gtf <- norm_path(r"(F:\index\hs\chm13\hs1.ncbiRefSeq.gtf.gz)")
@@ -54,14 +54,46 @@ if(file.exists(txdb_file)) {
   txdb <- txdbmaker::makeTxDbFromGFF(t2t_gtf)
   seqlevelsStyle(txdb) <- 'UCSC'
   seqlevels(txdb)
-  write_rds(txdb, txdb_file)
+  rio::export(txdb, txdb_file)
 }
 
+# geneset
+geneset_interest <- c(
+  "ADM","AKAP2","ALCAM","AMOTL2","ANKRD1","ANKRD13A","ANLN","ARHGAP29",
+  "ARHGEF28","AXL","C15orf52","CCDC80","COL12A1","CPA4","CRIM1","CTGF",
+  "CTNNA1","CYR61","CCN1","CCN2","DKK1","DUSP1","EFEMP1","EPB41L2","EVA1A","F3",
+  "FOSL1","FSP1","GADD45A","GADD45B","GAS6","IGFBP3","IRS1","LEPREL1",
+  "LIMA1","MGLL","NABP1","NEDD4","OPHN1","PALM2-AKAP2","PDLIM2","PLK2",
+  "ROR1","SEMA3C","SMURF2","STARD13","STOM","TAGLN","TBC1D23","TEAD1",
+  "TGM2","THBS1","UBASH3B","WWC2"
+)
 
 
-# prepare peak ------------------------------------------------
+# bigwig ------------------------------------------------
+# run used in heatmap profiling
+bw_suffix <- '.CPM.bw'
+bw_file <- '03_bam' %>% 
+  list.files(pattern=bw_suffix, full.names=T) %>% # bw
+  set_names(., nm=map_chr(., \(x) basename(x) %>% 
+                            str_replace(fixed(bw_suffix),''))) %>% 
+  # subset samples
+  .[which(str_detect(names(.), 'TEAD|BRD4'))] %>% 
+  print()
 
-## read peak ------------------------------------------------
+# reorder as heatmap needs
+new_order <- names(bw_file)[order(factor(sapply(strsplit(names(bw_file), "_"), `[`, 2)))]
+bw_file <- bw_file[new_order]
+
+# read bw
+bw <- bw_file %>% 
+  map(rtracklayer::import) %>% 
+  GRangesList() %>% 
+  set_style() %>% 
+  print()
+
+
+
+# peak ------------------------------------------------
 peak_suffix <- '.narrowPeak'
 peak_file <- '04_peaks' %>% 
   list.files(pattern=peak_suffix, full.names=T) %>% 
@@ -78,33 +110,34 @@ peak <- peak_file %>%
   print()
 
 
-### consensus ------------------------------------------------
+## consensus ------------------------------------------------
+
+# subset sample peak
 consensus <- peak %>% 
-  # subset samples
-  .[which(str_detect(names(.), 'TEAD'))] %>% 
+  # .[which(str_detect(names(.), 'TEAD'))] %>% 
   # , group=names(.) %>% str_replace_all("_\\d","")
-  compute_consensus(., min_occurrence=2, min_gapwidth=1)
+  compute_consensus(., min_occurrence=2, min_gapwidth=1) %>% 
+  {.$all} %>% 
+  # remove small fragment
+  {.[width(.) > 20]}
 
-consensus <- consensus$all
-# remove small fragment
-consensus <- consensus[width(consensus) > 20]
+# annotate peak
+anno <- consensus %>% 
+  ChIPseeker::annotatePeak(tssRegion=c(-3000, 3000),
+                           TxDb=txdb,
+                           level='gene',
+                           annoDb=annodb) %>% 
+  {.@anno}
 
-# # annotate consensus
-# anno <- consensus %>%
-#   ChIPseeker::annotatePeak(tssRegion=c(-3000, 3000),
-#                            TxDb=txdb,
-#                            level='gene',
-#                            annoDb=annodb)
-# consensus <- anno@anno
-# # peak within TSS
-# consensus_within_tss <- 
-#   (abs(consensus$distanceToTSS) <= 3000) %>% 
-#   consensus_peak[.] %>% 
-#   print()
-# rtracklayer::export(consensus_peak_within_tss, 'consensus_peak_within_tss.bed')
+# filter
+consensus <- anno %>% 
+  {.[.$geneId %in% geneset_interest]} %>%
+  {.[abs(.$distanceToTSS) <= 3000]} %>%
+  print()
 
 
-### tss overlap ------------------------------------------------
+
+## subset overlap ------------------------------------------------
 # tss <- getPromoters(TxDb=txdb, upstream=3000, downstream=3000)
 # 
 # hit <- findOverlaps(tss, consensus, minoverlap=1000)
@@ -115,7 +148,8 @@ consensus <- consensus[width(consensus) > 20]
 
 
 
-## read bam ------------------------------------------------
+# bam ------------------------------------------------
+# run only wnat to get DESeq2 degs using bam count
 bam_suffix <- '.filtered.bam'
 bam_file <- '03_bam' %>% 
   list.files(pattern=bam_suffix, full.names=T) %>%
@@ -152,11 +186,10 @@ count <- assay(bam_count, 'counts')
 rownames(count) <- as_tibble(consensus) %>% 
   unite('uid', 1:3) %>% pull(uid)
 colnames(count) <- names(bam_file)
-
 count[1:2,1:2]
 
 
-### deseq2 ------------------------------------------------
+## deseq2 ------------------------------------------------
 # coldata
 col_data <- colnames(count) %>% 
   tibble(sample=.) %>% 
@@ -185,30 +218,23 @@ dds_result_gr_anno <- dds_result %>%
   print()
 
 # tidy deg
-yap_targets <- c(
-  "CTGF","CCN2","ANKRD1","CYR61","CCN1","TOP2A","KIF14","CCNA2",
-  "CDCA8","CENPF","KIF23","KIF20B","KNTC1","RRM2",
-  "MCM3","SGOL1.AS1","TUBB","MYBL1","RAD18",
-  "ZWILCH","SGOL1","TIMELESS","GINS1","SMC3","TK1",
-  "MRE11A","MCM7","SUV39H2","GADD45B","FOSL1","CENPV",
-  "RUVBL2","MYC","GLI2","AXL","ABCB1","CAT","GPATCH4",
-  "LMNB2","TXN","WSB2","AREG","FOXF2","IGFBP3","RASSF2",
-  "AMOTL2","NPPB","CCND1")
 deg_tidy <- as_tibble(dds_result_gr_anno) %>% 
-  janitor::clean_names() %>% 
-  mutate(yap_targets=ifelse(gene_id %in% yap_targets, gene_id, NA)) %>% 
+  mutate(geneset_interest=ifelse(
+    geneId %in% geneset_interest, geneId, NA)) %>% 
   mutate(type=ifelse(
-    log2fold_change > log2(1.5) & padj < 0.05, 'pos',
-    ifelse(log2fold_change < log2(1/1.5) & padj < 0.05, 'neg', NA))) %>% 
-  mutate(label=ifelse(!is.na(yap_targets) & type %in% 'pos', yap_targets, NA)) %>% 
+    log2FoldChange > log2(1.5) & padj < 0.05, 'pos',
+    ifelse(log2FoldChange < log2(1/1.5) & padj < 0.05, 'neg', NA))) %>% 
+  mutate(label=ifelse(
+    !is.na(geneset_interest) & type %in% 'pos', geneset_interest, NA)) %>% 
   glimpse()
+dplyr::count(deg_tidy, type)
 # save
 writexl::write_xlsx(
   deg_tidy, str_glue('{Sys.Date()}_valcano_consensus_tead_deseq2_deg.xlsx'))
 
 # valcono
 p <- deg_tidy %>% 
-  ggplot(aes(log2fold_change, -log10(pvalue))) +
+  ggplot(aes(log2FoldChange, -log10(pvalue))) +
   geom_point(aes(color=type), alpha=0.7, show.legend=F) +
   scale_color_discrete(direction = -1) +
   ggrepel::geom_text_repel(aes(label=label), size=5, show.legend=F) +
@@ -217,28 +243,15 @@ p <- ggrastr::rasterize(p, dpi=600)
 ggsave(str_glue('{Sys.Date()}_valcano_consensus_tead_deseq2_deg.pdf'),
        p, width=5, height=5)
 
-
-
-## read bw ------------------------------------------------
-bw_suffix <- '.CPM.bw'
-bw_file <- '03_bam' %>% 
-  list.files(pattern=bw_suffix, full.names=T) %>% # bw
-  set_names(., nm=map_chr(., \(x) basename(x) %>% 
-                            str_replace(fixed(bw_suffix),''))) %>% 
-  # subset samples
-  .[which(str_detect(names(.), 'TEAD|BRD4'))] %>% 
-  print()
-
-# reorder as heatmap needs
-new_order <- names(bw_file)[order(factor(sapply(strsplit(names(bw_file), "_"), `[`, 2)))]
-bw_file <- bw_file[new_order]
-
-# read bw
-bw <- bw_file %>% 
-  map(rtracklayer::import) %>% 
-  GRangesList() %>% 
-  set_style() %>% 
-  print()
+# p <- deg_tidy %>% 
+#   ggplot(aes(base_mean, log2fold_change)) +
+#   geom_point(aes(color=type), alpha=0.7, show.legend=F) +
+#   scale_color_discrete(direction = -1) +
+#   ggrepel::geom_text_repel(aes(label=label), size=5, show.legend=F) +
+#   theme_bw()
+# p <- ggrastr::rasterize(p, dpi=600)
+# ggsave(str_glue('{Sys.Date()}_ma_consensus_tead_deseq2_deg.pdf'),
+#        p, width=5, height=5)
 
 
 
@@ -247,10 +260,13 @@ bw <- bw_file %>%
 
 # signal of interest
 soi <- bw %>% .[which(str_detect(names(.), 'TEAD|BRD4'))]
-rois <- dplyr::filter(deg_tidy, !is.na(type)) %>% 
-  split(., .[['type']]) %>% 
-  map(\(x) makeGRangesFromDataFrame(x, keep.extra.columns=T)) %>% 
-  print()
+
+# region of interest
+# rois <- dplyr::filter(deg_tidy, !is.na(type)) %>%
+#   split(., .[['type']]) %>%
+#   map(\(x) makeGRangesFromDataFrame(x, keep.extra.columns=T)) %>%
+#   print()
+rois <- GRangesList(yap_target=consensus) %>% print()
   
 for(idx in seq_along(rois)) {
   # region of interest
@@ -262,12 +278,23 @@ for(idx in seq_along(rois)) {
     mode='reference_point', reference_point="center",
     bin_size=50, scale='none'
   )
+  # set rowname
+  consensus_rowname <- roi@elementMetadata %>% as_tibble() %>% 
+    mutate(uid=str_glue('{geneId}_{row_number()}'),.by=geneId) %>% 
+    pull(uid)
+  labels <- str_subset(
+    consensus_rowname, paste0(geneset_interest, collapse="_|"))
   # plot
-  result <- heatmap_profile(mat_list,
-                            color_scales = c(0, NA), 
-                            colors = c("white", "#b12923"))
+  result <- heatmap_profile(
+    mat_list,
+    color_scales = c(0, NA), 
+    colors = c("white", "#b12923"),
+    rownames=consensus_rowname,
+    labels=labels
+  )
   # save
-  f_name <- str_glue('consensus_tead_and_deg_{names(rois)[idx]}')
+  # f_name <- str_glue('consensus_tead_and_deg_{names(rois)[idx]}')
+  f_name <- str_glue('{names(rois)[idx]}')
   pdf(str_glue("{Sys.Date()}_heatmap_{f_name}.pdf"), 
       width = length(result$heatmap)*1.6, height = 8)
   print(result$heatmap)
@@ -276,99 +303,6 @@ for(idx in seq_along(rois)) {
 
 
 
-
-# 
-# 
-# 
-# 
-# # calculate mat over signal
-# mat_list <- soi %>% 
-#   map(\(x) 
-#       normalizeToMatrix(
-#         signal=x, 
-#         target=resize(roi, width=1, fix=pos), 
-#         extend=3000, 
-#         value_column="score", 
-#         mean_mode="w0", w=50, keep=c(0, 0.99))
-#       )
-# 
-# p <- heatmap_profile(
-#   mat_list, roi, kmeans=2, return_granges=F)
-# 
-# # set global scale bar
-# all_values <- unlist(lapply(mat_list, function(m) as.vector(m)))
-# global_min <- quantile(all_values, 0.01)
-# global_max <- quantile(all_values, 0.99)
-# if(global_min < 0 & global_max > 0) {
-#   col_fun <- colorRamp2(
-#     breaks = c(global_min, 0, global_max),
-#     colors = c("#295072", "white", "#b12923"))
-# } else {
-#   col_fun <- colorRamp2(
-#     breaks = c(global_min, global_max),
-#     colors = c("white", "#a50026"))
-# }
-# 
-# # set same ylim for top annotation
-# all_ylim <- lapply(mat_list, function(mat) {
-#   # Extract the mean enrichment profile for this sample
-#   avg <- colMeans(mat, na.rm = TRUE)  # or colMeans if you used target_ratio
-#   c(min(avg), max(avg))
-# })
-# global_ymin <- min(sapply(all_ylim, `[`, 1)) * 0
-# global_ymax <- max(sapply(all_ylim, `[`, 2)) * 1.2
-# # rebuild the top_annotation with fixed ylim
-# fixed_anno <- HeatmapAnnotation(
-#   lines = anno_enriched(
-#     ylim = c(global_ymin, global_ymax),   # <-- THIS IS THE KEY
-#     gp = gpar(col = "black", lwd = 2),
-#     axis_param = list(
-#       at = c(global_ymin, 0, global_ymax),
-#       labels = c(round(global_ymin, 2), "0", round(global_ymax, 2)),
-#       side = "left"
-#     )),
-#   height = unit(2, "cm")  # make taller for visibility
-# )
-# # create heatmap over signal
-# ht_list <- NULL
-# for(i in seq_along(mat_list)) {
-#   mat <- mat_list[[i]]
-#   sample_name <- names(mat_list)[i] %>% 
-#     str_split_1('[.]') %>% 
-#     .[1]
-#   # plot
-#   ht <- EnrichedHeatmap(
-#     mat,
-#     name = sample_name,
-#     col = col_fun,
-#     axis_name = c("-3kb", "TSS", "3kb"),
-#     column_title = sample_name,
-#     top_annotation = fixed_anno,
-#     show_heatmap_legend = ifelse(i==1, T, F),
-#     heatmap_legend_param = list(
-#       title = "normalized",
-#       legend_direction = "horizontal",
-#       at = c(global_min, global_max),
-#       labels = c(round(global_min, 2), round(global_max, 2))),
-#     use_raster=TRUE
-#   )
-#   if(is.null(ht_list)) {
-#     ht_list <- ht
-#   } else ht_list <- ht_list + ht
-# }
-# 
-# # save plot
-# pdf(str_glue("{Sys.Date()}_heatmap_{vis_name}.pdf"), 
-#     width = length(ht_list)*1.6, height = 8)
-# draw(ht_list, 
-#      row_order = NULL,
-#      # column_split = sample_groups,
-#      # gap = unit(5, "mm"),
-#      heatmap_legend_side = "bottom",
-#      annotation_legend_side = "bottom",
-#      padding = unit(c(10, 10, 10, 10), "mm"),
-#      use_raster = TRUE)
-# while(dev.cur() != 1) dev.off()
 
 
 

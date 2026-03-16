@@ -515,6 +515,8 @@ heatmap_profile <- function(
     sort_by = c("mean", "median", "max", "none"),
     scale = c("none", "row", "column"),
     profile_height = unit(2, "cm"),
+    rownames = NULL,
+    labels = NULL,
     ...
 ) {
   
@@ -604,6 +606,37 @@ heatmap_profile <- function(
   }
   
   
+  # Apply rownames if provided (before sorting/clustering)
+  if (!is.null(rownames)) {
+    if (length(rownames) != nrow(mat_list[[1]])) {
+      stop("rownames length (", length(rownames), ") must match number of matrix rows (", nrow(mat_list[[1]]), ")")
+    }
+    mat_list <- lapply(mat_list, function(m) {
+      rownames(m) <- rownames
+      return(m)
+    })
+  }
+  
+  # Validate labels if provided
+  if (!is.null(labels)) {
+    if (is.null(rownames(mat_list[[1]]))) {
+      stop("labels requires rownames to be present. Provide via 'rownames' parameter or ensure input has rownames.")
+    }
+    
+    all_rownames <- rownames(mat_list[[1]])
+    matching <- labels %in% all_rownames
+    
+    if (!all(matching)) {
+      warning("labels contains ", sum(!matching), " values not found in rownames. Using only matching values.")
+      labels <- labels[matching]
+    }
+    
+    if (length(labels) == 0) {
+      stop("No labels values found in matrix rownames.")
+    }
+  }
+  
+  
   # Step 4: Sorting and Clustering
   
   # Validate sort_by_sample index
@@ -658,7 +691,7 @@ heatmap_profile <- function(
   }
   
   mat_list <- lapply(mat_list, function(m) m[row_order, , drop = FALSE])
-  
+
   
   # Step 5: Y-axis range and color scale
   # Bug fix 1: Calculate ylim per cluster when kmeans is enabled
@@ -699,6 +732,15 @@ heatmap_profile <- function(
   
   # Step 6: Plotting
   ht_list <- NULL
+  
+  # Prepare row names for display if labels is provided
+  if (!is.null(labels)) {
+    current_rownames <- rownames(mat_list[[1]])
+    row_names_display <- ifelse(current_rownames %in% labels, current_rownames, "")
+  } else {
+    row_names_display <- NULL
+  }
+  
   for (j in seq_along(mat_list)) {
     
     top_anno <- HeatmapAnnotation(
@@ -715,8 +757,20 @@ heatmap_profile <- function(
       annotation_name_side = "left"
     )
     
+    # Determine row names settings for first heatmap
+    if (j == 1 && !is.null(labels)) {
+      mat_for_ht <- mat_list[[1]]
+      rownames(mat_for_ht) <- row_names_display
+      show_row_names_val <- TRUE
+      row_names_side_val <- "left"
+    } else {
+      mat_for_ht <- mat_list[[j]]
+      show_row_names_val <- FALSE
+      row_names_side_val <- NULL
+    }
+    
     ht <- EnrichedHeatmap(
-      mat_list[[j]],
+      mat_for_ht,
       col = col_fun,
       name = if (j > 1) NULL else "Signal",
       column_title = names(mat_list)[j],
@@ -725,7 +779,8 @@ heatmap_profile <- function(
       split = cluster_split,
       cluster_rows = FALSE,
       top_annotation = top_anno,
-      show_row_names = FALSE,
+      show_row_names = show_row_names_val,
+      row_names_side = row_names_side_val,
       use_raster = TRUE,
       show_heatmap_legend = (j == 1),
       heatmap_legend_param = list(
