@@ -490,6 +490,20 @@ setup_genome() {
             CHROM_SIZES="${FASTA}.fai"
             GSIZE=2654621783
             ;;
+        cel)
+            INDEX_DIR="$index_rootdir/cel"
+            FASTA="${INDEX_DIR}/Caenorhabditis_elegans.WBcel235.dna.toplevel.fa.gz"
+            GTF="${INDEX_DIR}/Caenorhabditis_elegans.WBcel235.63.gtf.gz"
+            CHROM_SIZES="${FASTA}.fai"
+            GSIZE=90000000
+            ;;
+        fly)
+            INDEX_DIR="$index_rootdir/fly"
+            FASTA="${INDEX_DIR}/Drosophila_melanogaster.BDGP6.54.dna.toplevel.fa.gz"
+            GTF="${INDEX_DIR}/Drosophila_melanogaster.BDGP6.54.63.gtf.gz"
+            CHROM_SIZES="${FASTA}.fai"
+            GSIZE=120000000
+            ;;
     esac
     
     # Setup common indices

@@ -7,7 +7,7 @@ root_dir: "."
 # Directory containing raw FASTQ files
 fastq_dir: 01.RawData
 
-# Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13)
+# Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13), "cel" (C. elegans), "fly" (fruit fly)
 species: hs
 
 # Sample sheet CSV file (must contain columns: sample,group,control,target,fq1,fq2)
@@ -58,7 +58,15 @@ index_rootdir: /mnt/d/index
 #   │   ├── salmon/
 #   │   ├── star/
 #   │   └── gencode.vM38.annotation.gtf.gz
-#   └── hs/chm13/                    # Human T2T-CHM13
-#       ├── salmon/
-#       ├── star/
-#       └── chm13v2.0.gtf.gz
+#   ├── hs/chm13/                    # Human T2T-CHM13
+#   │   ├── salmon/
+#   │   ├── star/
+#   │   └── chm13v2.0.gtf.gz
+#   ├── cel/                         # C. elegans WBcel235
+#   │   ├── bowtie2/
+#   │   ├── Caenorhabditis_elegans.WBcel235.dna.toplevel.fa.gz
+#   │   └── ...
+#   ├── fly/                         # Fruit fly BDGP6.54
+#   │   ├── bowtie2/
+#   │   ├── Drosophila_melanogaster.BDGP6.54.dna.toplevel.fa.gz
+#   │   └── ...

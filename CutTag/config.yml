@@ -2,13 +2,13 @@
 
 # ============================= Basic Settings =============================
 # root directory of project
-root_dir: "."
+root_dir: "/mnt/f/workspace/EED_CutTag/mice"
 
 # Directory containing raw FASTQ files
-fastq_dir: 01.RawData
+fastq_dir: rawdata
 
-# Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13)
-species: hs
+# Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13), "cel" (C. elegans), "fly" (fruit fly)
+species: mm
 
 # Sample sheet CSV file (must contain columns: sample,group,control,target,fq1,fq2)
 samplesheet: samplesheet.csv
@@ -44,7 +44,7 @@ macs_parameter: --nomodel --shift -100 --extsize 200 -q 0.05
 # Root directory containing genome indices
 # Modify this to match your system's index location
 # check helper.sh setup_genome for details
-index_rootdir: /mnt/d/index
+index_rootdir: /mnt/f/index
 
 # Expected directory structure under index_rootdir:
 #   index_rootdir/
@@ -61,6 +61,14 @@ index_rootdir: /mnt/d/index
 #   ├── mm/vM38/             # Mouse GRCm39
 #   │   ├── bowtie2/
 #   │   ├── GRCm39.primary_assembly.genome.fa.gz
+#   │   └── ...
+#   ├── cel/                 # C. elegans WBcel235
+#   │   ├── bowtie2/
+#   │   ├── Caenorhabditis_elegans.WBcel235.dna.toplevel.fa.gz
+#   │   └── ...
+#   ├── fly/                 # Fruit fly BDGP6.54
+#   │   ├── bowtie2/
+#   │   ├── Drosophila_melanogaster.BDGP6.54.dna.toplevel.fa.gz
 #   │   └── ...
 #   └── Ecoli_novoprotein/   # Spike-in genome
 #       └── bowtie2/
