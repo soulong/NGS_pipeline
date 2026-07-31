@@ -151,10 +151,21 @@ bam_filter() {
     local flagstat_filtered="$ALIGN_DIR/${sample}.filtered.flagstat"
     
     if [[ ! -s "$flagstat_filtered" ]]; then
-        # unmapped (4), mate unmapped (8), secondary (256), failed QC (512), duplicate (1024) → 4+8+256+512+1024 = 1804
-        log_info "[$sample] Filtering BAM (MAPQ≥30, proper pairs, no chrM/dups)"
+        local chr_filter
+        case "$SPECIES" in
+            chm13|hs|mm)
+                chr_filter='rname =~ "^chr([0-9]+|X|Y)$"'
+                ;;
+            cel)
+                chr_filter='rname =~ "^(I|II|III|IV|V|X)$"'
+                ;;
+            fly)
+                chr_filter='rname =~ "^(2[LR]|3[LR]|4|X|Y)$"'
+                ;;
+        esac
+        log_info "[$sample] Filtering BAM (MAPQ≥30, proper pairs, main chromosomes)"
         samtools view -@ "$THREADS" -b -f 2 -q 30 -F 1804 \
-            -e 'rname != "chrM" && ! (rname =~ "^(GL|KI|JH|MU|chrUn|random|alt)")' \
+            -e "$chr_filter" \
             -o "$filtered_bam" "$markdup_bam"
         sambamba index -t "$THREADS" "$filtered_bam" 2>/dev/null
         sambamba flagstat -t "$THREADS" "$filtered_bam" > "$flagstat_filtered" 2>/dev/null
