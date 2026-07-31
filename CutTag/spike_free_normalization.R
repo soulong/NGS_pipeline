@@ -7,7 +7,7 @@ library(yaml)
 rstudioapi::getActiveDocument()$path |> 
   dirname() |> setwd()
 
-config <- "config.yaml" %>% read_yaml()
+config <- "config.yml" %>% read_yaml()
 gsize_file <- config$index_rootdir %>% 
   file.path('hs/chm13/chm13v2.0.fa.gz.fai')
 

@@ -1,3 +1,4 @@
+
 library(GenomicAlignments)
 library(GenomicRanges)
 library(rtracklayer)
@@ -5,7 +6,8 @@ library(Rsamtools)
 library(tidyverse)
 library(DESeq2)
 
-setwd("F:/workspace/2026-01-16_EED_NMN_LH/IMR/result")
+
+setwd("D:\\workspace\\EED_CutTag\\c_elegans\\result")
 
 source("F:/GitHub/myScript/NGS/peak_process.R")
 

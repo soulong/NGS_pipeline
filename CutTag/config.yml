@@ -2,12 +2,12 @@
 
 # ============================= Basic Settings =============================
 # root directory of project
-root_dir: "."
+root_dir: "/mnt/d/EED_CutTag/fly"
 
 # Directory containing raw FASTQ files
 fastq_dir: 01.RawData
 
-# Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13)
+# Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13), "fly" (Drosophila), "cel" (C. elegans)
 species: hs
 
 # Sample sheet CSV file (must contain columns: sample,group,control,target,fq1,fq2)
@@ -37,8 +37,9 @@ norm_method: CPM
 # Peak calling with MACS3
 call_peak: true
 
-# MACS3 parameters used for peak calling. Example: "--nomodel --shift -100 --extsize 200 -q 0.01 --broad"
-macs_parameter: --nomodel --shift -100 --extsize 200 -q 0.05
+# MACS3 parameters used for peak calling. Example: "--nomodel --shift -100 --extsize 200 -q 0.01 --broad --broad-cutoff 0.05"
+# "-g hs -f BAMPE --keep-dup all" is already inlcued in script
+macs_parameter: -q 0.01 --broad --broad-cutoff 0.05
 
 # ============================= Index Paths =============================
 # Root directory containing genome indices
@@ -61,6 +62,14 @@ index_rootdir: /mnt/d/index
 #   ├── mm/vM38/             # Mouse GRCm39
 #   │   ├── bowtie2/
 #   │   ├── GRCm39.primary_assembly.genome.fa.gz
+#   │   └── ...
+#   ├── fly/                 # Drosophila BDGP6.54
+#   │   ├── bowtie2/
+#   │   ├── Drosophila_melanogaster.BDGP6.54.dna.toplevel.fa.gz
+#   │   └── ...
+#   ├── cel/                 # C. elegans WBcel235
+#   │   ├── bowtie2/
+#   │   ├── Caenorhabditis_elegans.WBcel235.dna.toplevel.fa.gz
 #   │   └── ...
 #   └── Ecoli_novoprotein/   # Spike-in genome
 #       └── bowtie2/

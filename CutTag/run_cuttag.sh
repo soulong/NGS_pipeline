@@ -33,6 +33,7 @@ parse_yaml_config() {
     local config="$1"
     
     # Simple YAML parser (handles key: value pairs)
+    declare -a CUSTOM_BED_REGIONS=()
     while IFS=': ' read -r key value || [[ -n "$key" ]]; do
         # Skip comments and empty lines
         [[ "$key" =~ ^[[:space:]]*# ]] && continue
@@ -72,7 +73,7 @@ parse_yaml_config() {
                 fi
                 ;;
         esac
-    done < "$config"
+    done < <(tr -d '\r' < "$config")
 
     # Peak file extension used by MACS3: broad -> broadPeak, otherwise narrowPeak
     if [[ "$MACS_PARAMETER" =~ --broad ]]; then

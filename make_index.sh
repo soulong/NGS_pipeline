@@ -34,19 +34,26 @@ cdna_link=https://ftp.ensembl.org/pub/release-116/fasta/drosophila_melanogaster/
 
 
 ## set directory
-# target_dir=/mnt/d/Index/hs/v49
-target_dir=/mnt/d/Index/fly
+# target_dir=/mnt/d/index/hs/v49
+target_dir=/mnt/d/index/fly
+# target_dir=/mnt/d/index/cel   # uncomment for C. elegans
 root_dir=$target_dir && mkdir -p $root_dir && cd $root_dir && echo ">>>>>> start to processing <<<<<<<"1
 
 
 #################################  process data  #################################
+
+# # convert to bgzip format
+# gunzip -c $fasta_gz | bgzip -c > bgzip$fasta_gz && mv bgzip$fasta_gz $fasta_gz
+# # index .fa.gz files
+# samtools faidx $fasta_gz
+
+
 # fasta
 fasta_gz=$(basename "$fasta_link")
 fasta=${fasta_gz%.gz}
 [ ! -f "$fasta_gz" ] && echo "downloading fasta" && wget $fasta_link -O $fasta_gz
 [ ! -f "${fasta}.fai" ] && gunzip -k $fasta_gz && samtools faidx $fasta
 
-# gtf
 gtf_gz=$(basename "$gtf_link")
 gtf=${gtf_gz%.gz}
 [ ! -f "$gtf_gz" ] && echo "downloading gtf" && wget $gtf_link -O $gtf_gz

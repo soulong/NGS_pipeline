@@ -1,188 +1,164 @@
 
-# ==== Setup ====
-rstudioapi::getActiveDocumentContext()$path |>
-  dirname() |>
-  setwd()
-
 library(tidyverse)
 library(GenomicAlignments)
 library(GenomicRanges)
 library(GenomeInfoDb)
 library(ChIPseeker)
-library(TxDb.Hsapiens.UCSC.hg38.knownGene)
-library(TxDb.Mmusculus.UCSC.mm39.knownGene)  # Only mouse needed
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)   # hs
+library(TxDb.Mmusculus.UCSC.mm39.knownGene)  # mm
+library(TxDb.Celegans.UCSC.ce11.refGene)     # celegans
+library(TxDb.Dmelanogaster.UCSC.dm6.ensGene) # fly
 library(rtracklayer)
 library(furrr)
-
 options(future.globals.maxSize=2 * 1024^3)  # 2GB if needed
 
-setwd("F:/workspace/IMR/result")
+
+# config ------------
+setwd("D:\\EED_CutTag\\fly\\result")
 # setwd("F:/workspace/J009_IMR_0_0.3_0.6/result")
 
+# txdb <- TxDb.Celegans.UCSC.ce11.refGene
+txdb <- TxDb.Dmelanogaster.UCSC.dm6.ensGene
 
-# ==== Input ====
-peak_files <- list.files("04_peaks", pattern="broadPeak$", full.names=TRUE, recursive=FALSE)
+bam_dir <- "03_bam"
+peak_dir <- "04_peaks"
+peak_pattern <- "broadPeak$"
+consensus_peakfile <- "04_peaks/consensus_H3K27me3.bed"
+
+
+peak_files <- list.files(peak_dir, pattern=peak_pattern, full.names=TRUE, recursive=FALSE)
+
 df <- tibble(
   peak_file=peak_files,
   sample=basename(peak_files) %>% str_replace("_peaks.*Peak$", ""),
-  bam_file=str_c("03_alignment/", sample, ".filtered.bam")
-)
+  bam_file=str_c(bam_dir, "/", sample, ".filtered.bam")
+) |> print()
 
-# ==== Genomic resources (minimal, standard chromosomes only) ====
-genes <- genes(TxDb.Hsapiens.UCSC.hg38.knownGene) %>%
-# genes <- genes(TxDb.Mmusculus.UCSC.mm39.knownGene) %>%
+
+
+# genomic data ------------
+gene <- genes(txdb) %>%
   keepStandardChromosomes(pruning.mode="coarse") %>%
+  GenomicRanges::reduce() |> 
   sort()
+seqlevelsStyle(gene) <- "UCSC"
+seqlevels(gene)
 
-genes_reduced <- genes %>%
-  resize(width=width(.) + 2000, fix="center") %>%
-  reduce()
+gene_gr <- gene %>%
+  # resize(width=width(.) + 2000, fix="center") %>%
+  GenomicRanges::reduce()
 
-tss_reduced <- promoters(genes, 1000, 1000) %>%
-  reduce()
+tss_gr <- promoters(gene, 1000, 1000) %>%
+  GenomicRanges::reduce()
 
-consensus <- rtracklayer::import("04_peaks/consensus.bed") %>%
-  keepStandardChromosomes(pruning.mode="coarse")
+consensus_gr <- rtracklayer::import(consensus_peakfile) %>%
+  keepStandardChromosomes(pruning.mode="coarse") |> 
+  GenomicRanges::reduce()
+seqlevelsStyle(consensus_gr) <- "UCSC"
+seqlevels(consensus_gr)
 
 
-# ==== Functions (optimized for parallelization) ====
-compute_region <- function(gr, g, t) {
-  in_gene <- reduce(subsetByOverlaps(gr, g, ignore.strand=FALSE))
-  flank_gene <- reduce(c(
-    flank(in_gene, width=10000, start=TRUE,  both=FALSE),
-    flank(in_gene, width=10000, start=FALSE, both=FALSE)
-  ))
-  
-  in_tss <- reduce(subsetByOverlaps(gr, t, ignore.strand=FALSE))
-  flank_tss <- reduce(c(
-    flank(in_tss, width=3000, start=TRUE,  both=FALSE),
-    flank(in_tss, width=3000, start=FALSE, both=FALSE)
-  ))
-  
-  list(
-    in_gene=in_gene, flank_gene=flank_gene,
-    in_tss=in_tss, flank_tss=flank_tss
-  )
-}
-
-do_sampling <- function(peak, peak_name, g, t, sample_size) {
-  if (length(peak) < sample_size) sample_size <- length(peak)
-  sampled <- sample(peak, size=sample_size, replace=FALSE)
-  regions <- compute_region(sampled, g, t)
-  names(regions) <- paste0(peak_name, "_", names(regions))
-  regions[[peak_name]] <- sampled
-  regions
-}
-
-# Main worker function: minimal input, no side effects
-get_stats_one_rep <- function(
-    bam_gr, peak,
-    g, t, consens,
-    sample_size
+# functions ------------
+calculate_ratio_separated <- function(
+    target_gr, query_gr_list, sample_ratio=0.25
 ) {
-  if (sample_size==0) {
-    gene_sampled <- g
-    tss_sampled  <- t
-  } else {
-    gene_sampled <- sample(g, sample_size, replace=FALSE)
-    tss_sampled  <- sample(t, sample_size, replace=FALSE)
-  }
-
   
-  gene_flank <- reduce(c(
-    flank(gene_sampled, 10000, start=TRUE,  both=FALSE),
-    flank(gene_sampled, 10000, start=FALSE, both=FALSE)
-  ))
-  tss_flank <- reduce(c(
-    flank(tss_sampled, 3000, start=TRUE,  both=FALSE),
-    flank(tss_sampled, 3000, start=FALSE, both=FALSE)
-  ))
+  res <- map(seq_along(query_gr_list), \(idx) {
+    # idx <- 5
+    roi <- query_gr_list[[idx]]
+    roi_name <- names(query_gr_list)[idx]
+    
+    if(sample_ratio==0)  roi_sampled <- roi else 
+      roi_sampled <- sample(roi, floor(length(roi) * sample_ratio), replace=FALSE) |> sort()
+    
+    roi_sampled_L <- flank(roi_sampled, width=floor(1.0*width(roi_sampled)), 
+                           start=TRUE, both=FALSE, ignore.strand=T) |> 
+      sort()
+    roi_sampled_R <- flank(roi_sampled, width=floor(1.0*width(roi_sampled)), 
+                           start=FALSE, both=FALSE, ignore.strand=T) |> 
+      sort()
+    
+    cnt <- list(roi_sampled, roi_sampled_L, roi_sampled_R) |> 
+      set_names(c('_IN', '_L','_R')) |> 
+      map(\(x) sum(countOverlaps(target_gr, x, ignore.strand=TRUE))) %>% 
+      list_c()
+    
+    enframe(cnt, name="region", value="count") %>%
+      pivot_wider(names_from=region, values_from=count) |> 
+      dplyr::rename_with(\(x) str_c(roi_name, x))
+  }  )
   
-  regions <- list(
-    gene=gene_sampled,
-    tss=tss_sampled,
-    gene_flank=gene_flank,
-    tss_flank=tss_flank
-  )
-  
-  if (!is.null(peak))      regions <- c(regions, do_sampling(peak, "peak", g, t, sample_size))
-  if (!is.null(consens))   regions <- c(regions, do_sampling(consens, "consensus", g, t, sample_size))
-  
-  counts <- map_int(regions, ~ sum(countOverlaps(bam_gr, .x, ignore.strand=TRUE)))
-  enframe(counts, name="region", value="count") %>%
-    pivot_wider(names_from=region, values_from=count)
+  return(purrr::reduce(res, cbind))
 }
 
-# Wrapper: read BAM once
-get_stats <- function(bam_path, peak_path,
-                      g, t, consens,
-                      sample_rep=200, sample_size=3000) {
+
+get_sample_stat <- function(
+    bam_path, peak_path,
+    sample_times=100, sample_ratio=0.25) {
   
-  # Read BAM ONCE per sample (outside future_map)
-  bam_gr <- GenomicAlignments::readGAlignmentPairs(bam_path) %>% granges()
-  
-  # Clip sample_size if too large
-  sample_size <- min(sample_size, length(bam_gr), length(g), length(t))
+  # Read BAM ONCE per sample
+  bam_gr <- GenomicAlignments::readGAlignmentPairs(bam_path) %>% 
+    granges() |> 
+    keepStandardChromosomes(pruning.mode="coarse") |> 
+    sort()
+  seqlevelsStyle(bam_gr) <- "UCSC"
   
   # peak
   peak_gr <- rtracklayer::import(peak_path) %>% 
-    keepStandardChromosomes(pruning.mode="coarse") %>% 
-    reduce()
+    keepStandardChromosomes(pruning.mode="coarse")
+  seqlevelsStyle(peak_gr) <- "UCSC"
   
-  res <- map(
-    seq_len(sample_rep),
-    \(x) get_stats_one_rep(bam_gr, peak_gr, g, t, consens, sample_size))
+  query_gr_list = lst(bam=bam_gr, peak=peak_gr, gene=gene_gr, tss=tss_gr, consensus=consensus_gr)
   
-  data <- list_rbind(res, names_to="sampling_rep") %>%
-    mutate(total=length(bam_gr), .before=1)
+  res <- future_map(
+    seq_len(sample_times), \(x) calculate_ratio_separated(
+      bam_gr, query_gr_list, sample_ratio)
+  )
   
-  return(data)
+  return(list_rbind(res, names_to="sample_times"))
 }
 
 
-# ==== Run in parallel across samples ====
-# Flatten: one future per (sample, rep) is too fine; better: one future per sample
-plan(multisession, workers=min(6, nrow(df)))  # one worker per sample
 
-stats <- future_map2(
-  df$bam_file, df$peak_file,
-  \(x, y) get_stats(x, y, genes_reduced, tss_reduced, consensus,
-                    sample_rep=200, sample_size=3000)) %>%
-  set_names(df$sample)
+# run ------------
+plan(multisession, workers=min(4, nrow(df))) 
+
+stats <- list()
+for(idx in seq_len(nrow(df))) {
+  print(str_c('processing: ', df$sample[idx]))
+  stats[[df$sample[idx]]] <- get_sample_stat(
+    df$bam_file[idx], df$peak_file[idx], sample_times=100, sample_ratio=0.25)
+}
 
 plan(sequential)
 
 
-# ==== Post-processing ====
+
+
+# plot ------------
 stats_tidy <- stats %>%
-  list_rbind(names_to="sample") %>%
+  list_rbind(names_to="sample") %>% #glimpse()
   mutate(
-    peak_of_total=peak / total,
-    consensus_of_total=consensus / total,
-    gene_of_total=gene / total,
-    tss_of_total=tss / total,
-    gene_in_of_flank=gene / gene_flank,
-    tss_in_of_flank=tss / tss_flank,
-    consensus_gene_in_of_flank=consensus_in_gene / consensus_flank_gene,
-    consensus_tss_in_of_flank=consensus_in_tss / consensus_flank_tss,
-    peak_in_of_flank=peak_in_gene / peak_flank_gene,
-    peak_tss_in_of_flank=peak_in_tss / peak_flank_tss
-  )
-
-# Save
-writexl::write_xlsx(stats_tidy, glue::glue("{Sys.Date()}_stats_tidy.xlsx"))
-
-# Summary
+    random = bam1 * 2 / (bam2 + bam3),
+    consensus = consensus1 * 2 / (consensus2 + consensus3),
+    peak = peak1 * 2 / (peak2 + peak3),
+    gene = gene1 * 2 / (gene2 + gene3),
+    tss = tss2 * 2 / (tss2 + tss3)
+  ) |> 
+  as_tibble()
 summary_stats <- stats_tidy %>%
   summarise(across(everything(), mean), .by=sample) %>% 
   glimpse()
 
+writexl::write_xlsx(stats_tidy, glue::glue("{Sys.Date()}_stats_tidy.xlsx"))
+
+
 
 # Plot
-metrics <- colnames(stats_tidy) %>% str_subset("_of_")
+metrics <- colnames(stats_tidy)[18:21]
 plots <- map(metrics, ~ {
   stats_tidy %>%
-    separate_wider_delim(sample, delim="_", names=c("group","replicagte"), cols_remove=F) %>% 
+    separate_wider_delim(sample, delim="-", names=c("group","rep"), cols_remove=F) %>% 
     # mutate(sample_split=str_split(sample, "_", simplify=TRUE)) %>%
     # mutate(group=ifelse(ncol(sample_split) >= 2, sample_split[,1], sample)) %>%
     ggplot(aes(sample, .data[[.x]], fill=group)) +
@@ -199,14 +175,5 @@ patchwork::wrap_plots(plots, ncol=1) %>%
 
 
 
-
-
-stats <- future_map2(
-  df$bam_file, df$peak_file,
-  \(x, y) get_stats(x, y, genes_reduced, tss_reduced, consensus,
-                    sample_rep=1, sample_size=0)) %>%
-  set_names(df$sample)
-
-# plan(sequential)
 
 

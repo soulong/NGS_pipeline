@@ -33,6 +33,7 @@ parse_yaml_config() {
     local config="$1"
     
     # Simple YAML parser (handles key: value pairs)
+    declare -a CUSTOM_BED_REGIONS=()
     while IFS=': ' read -r key value || [[ -n "$key" ]]; do
         # Skip comments and empty lines
         [[ "$key" =~ ^[[:space:]]*# ]] && continue
@@ -72,7 +73,7 @@ parse_yaml_config() {
                 fi
                 ;;
         esac
-    done < "$config"
+    done < <(tr -d '\r' < "$config")
 
     # Peak file extension used by MACS3: broad -> broadPeak, otherwise narrowPeak
     if [[ "$MACS_PARAMETER" =~ --broad ]]; then
@@ -255,59 +256,57 @@ run_macs() {
 # ============================= Peak Consensus =============================
 run_consensus() {
     # Collect samples by target
-    # declare -A target_peaks
-    # declare -a all_peak_files
-# 
-    # while IFS=, read -r sample group control target fq1 fq2 || [[ -n "${sample:-}" ]]; do
-        # [[ "$sample" == "sample" ]] && continue
-        # [[ -z "$sample" ]] && continue
-# 
-        # local peak_file="$PEAK_DIR/${sample}${PEAK_EXT}"
-        # [[ ! -f "$peak_file" ]] && continue
-# 
-        # all_peak_files+=("$peak_file")
-# 
-        # if [[ -n "group" ]]; then
-            # if [[ -z "${target_peaks[$target]:-}" ]]; then
-                # target_peaks[$target]="$peak_file"
-            # else
-                # target_peaks[$target]="${target_peaks[$target]} $peak_file"
-            # fi
-        # fi
-    # done < <(tail -n +2 "$SAMPLESHEET" | tr -d '\r')
-# 
+    declare -A target_peaks
+    declare -a all_peak_files
+
+    while IFS=, read -r sample group control target fq1 fq2 || [[ -n "${sample:-}" ]]; do
+        [[ "$sample" == "sample" ]] && continue
+        [[ -z "$sample" ]] && continue
+
+        local peak_file="$PEAK_DIR/${sample}${PEAK_EXT}"
+        [[ ! -f "$peak_file" ]] && continue
+
+        all_peak_files+=("$peak_file")
+
+        if [[ -n "$target" ]]; then
+            if [[ -z "${target_peaks[$target]:-}" ]]; then
+                target_peaks[$target]="$peak_file"
+            else
+                target_peaks[$target]="${target_peaks[$target]} $peak_file"
+            fi
+        fi
+    done < <(tail -n +2 "$SAMPLESHEET" | tr -d '\r')
+
     # Create consensus for each target
-    # for target in "${!target_peaks[@]}"; do
-        # local -a peaks=()
-        # read -ra peaks <<< "${target_peaks[$target]}"
-        # echo "$target: ${peaks[@]}"
-# 
-        # if [[ ${#peaks[@]} -eq 0 ]]; then
-            # log_warn "No peak files for target: $target"
-            # continue
-        # fi
-# 
-        # local consensus_bed="${PEAK_DIR}/consensus_${target}.bed"
-        # if [[ ! -s "$consensus_bed" ]]; then
-            # log_info "[$target] Make consensus from ${#peaks[@]} samples"
-            # log_info "Samples: ${peaks[@]}"
-            # merge_peakfiles --input-peaks "${peaks[*]}" --output-bed "$consensus_bed" --chrom-size "$CHROM_SIZES" || \
-                # { 
-                    # log_warn "Failed to create consensus for: $target"
-                    # continue
-                # }
-        # else 
-            # log_info "[$target] Consensus peak completed"
-        # fi
-    # done
+    for target in "${!target_peaks[@]}"; do
+        local -a peaks=()
+        read -ra peaks <<< "${target_peaks[$target]}"
+
+        if [[ ${#peaks[@]} -eq 0 ]]; then
+            log_warn "No peak files for target: $target"
+            continue
+        fi
+
+        local consensus_bed="${PEAK_DIR}/consensus_${target}.bed"
+        if [[ ! -s "$consensus_bed" ]]; then
+            log_info "[$target] Make consensus from ${#peaks[@]} samples"
+            merge_peakfiles --input-peaks "${peaks[*]}" --output-bed "$consensus_bed" --chrom-size "$CHROM_SIZES" || \
+                { 
+                    log_warn "Failed to create consensus for: $target"
+                    continue
+                }
+        else 
+            log_info "[$target] Consensus peak completed"
+        fi
+    done
 
     # Create consensus for all samples, only if N target > 1
-    # if [[ ${#target_peaks[@]} -gt 1 ]] && [[ ! -s "${PEAK_DIR}/consensus_all.bed" ]]; then
-	local consensus_bed="${PEAK_DIR}/consensus_all.bed"
-	log_info "Creating consensus peaks for: all (${#all_peak_files[@]} samples)"
-	merge_peakfiles --input-peaks "${all_peak_files[*]}" --output-bed "$consensus_bed" --chrom-size "$CHROM_SIZES" || \
-		log_warn "Failed to create consensus for: all"
-    # fi
+    if [[ ${#target_peaks[@]} -gt 1 ]] && [[ ! -s "${PEAK_DIR}/consensus_all.bed" ]]; then
+        local consensus_bed="${PEAK_DIR}/consensus_all.bed"
+        log_info "Creating consensus peaks for: all (${#all_peak_files[@]} samples)"
+        merge_peakfiles --input-peaks "${all_peak_files[*]}" --output-bed "$consensus_bed" --chrom-size "$CHROM_SIZES" || \
+            log_warn "Failed to create consensus for: all"
+    fi
 }
 
 
@@ -541,7 +540,7 @@ run_global_qc() {
     
     # MultiQC
     log_info "[Multi QC] Generating MultiQC report"
-    multiqc "$OUTDIR" --force -o "$MULTIQC_DIR" --title "CUT&Tag Analysis" 2>/dev/null || true
+    multiqc "$OUTDIR" --force -o "$MULTIQC_DIR" --title "ATACseq Analysis" 2>/dev/null || true
 }
 
 
@@ -565,7 +564,7 @@ main() {
     exec > >(tee -a "$log_file") 2>&1
     
     log_info "============================================================"
-    log_info "CUT&Tag Analysis Pipeline"
+    log_info "ATACseq Analysis Pipeline"
     log_info "============================================================"
 
     # Setup genome

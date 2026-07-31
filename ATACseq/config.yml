@@ -7,7 +7,7 @@ root_dir: "."
 # Directory containing raw FASTQ files
 fastq_dir: rawdata
 
-# Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13)
+# Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13), "fly" (Drosophila), "cel" (C. elegans)
 species: chm13
 
 # Sample sheet CSV file (must contain columns: sample,group,control,target,fq1,fq2)
@@ -64,6 +64,14 @@ index_rootdir: /mnt/d/index
 #   ├── mm/vM38/             # Mouse GRCm39
 #   │   ├── bowtie2/
 #   │   ├── GRCm39.primary_assembly.genome.fa.gz
+#   │   └── ...
+#   ├── fly/                 # Drosophila BDGP6.54
+#   │   ├── bowtie2/
+#   │   ├── Drosophila_melanogaster.BDGP6.54.dna.toplevel.fa.gz
+#   │   └── ...
+#   ├── cel/                 # C. elegans WBcel235
+#   │   ├── bowtie2/
+#   │   ├── Caenorhabditis_elegans.WBcel235.dna.toplevel.fa.gz
 #   │   └── ...
 #   └── Ecoli_novoprotein/   # Spike-in genome (not used for ATACseq)
 #       └── bowtie2/
