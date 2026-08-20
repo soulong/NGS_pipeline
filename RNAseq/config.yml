@@ -1,4 +1,4 @@
-## RNA-seq Pipeline Configuration File
+# RNA-seq Pipeline Configuration File
 
 # ============================= Basic Settings =============================
 # root directory of project
@@ -24,14 +24,28 @@ skip_preprocess: false
 
 # ============================= Analysis Options =============================
 
+# Run Salmon quantification
+run_salmon: true
+
 # Run STAR alignment (generates BAM files)
 # Set to true if you need BAM files for visualization or other downstream analysis
-run_star: true
+run_star: false
 
-# Run featureCounts for gene-level quantification
+# Run featureCounts for gene-level quantification from BAM files
 # Requires run_star: true
 # Note: Salmon already provides transcript/gene counts, featureCounts is optional
-run_featurecounts: true
+run_featurecounts: false
+
+# Run gene/transcript quantification with pytximport (Phase 4).
+# Replaces the deprecated R-based quantification (deprecated_Quantification.qmd)
+# with python-based quantification (quantification.py), merged into the bash
+# pipeline. Outputs are written to quantification_dir as date-stamped xlsx:
+#   <date>_transcript_expression.xlsx / <date>_gene_expression.xlsx
+run_quantification: true
+
+# Directory (relative to root_dir) where quantification results are written.
+# Read by DESeq2.qmd and Enrichment.qmd.
+quantification_dir: quantification
 
 # ============================= Library Settings =============================
 
@@ -50,21 +64,30 @@ index_rootdir: /mnt/d/index
 
 # Expected directory structure under index_rootdir:
 #   index_rootdir/
-#   ├── hs/                          # Human
-#   │   ├── salmon/                  # Salmon index
-#   │   ├── star/                    # STAR index
-#   │   └── gencode.v49.basic.annotation.gtf.gz
-#   ├── mm/                          # Mouse
+#   ├── hs/v49/              # Human GRCh38
 #   │   ├── salmon/
 #   │   ├── star/
-#   │   └── gencode.vM38.annotation.gtf.gz
-#   ├── fly/                          # Drosophila BDGP6.54
-#   │   ├── bowtie2/
-#   │   └── Drosophila_melanogaster.BDGP6.54.dna.toplevel.fa.gz
-#   ├── cel/                          # C. elegans WBcel235
-#   │   ├── bowtie2/
-#   │   └── Caenorhabditis_elegans.WBcel235.dna.toplevel.fa.gz
-#   └── hs/chm13/                    # Human T2T-CHM13
+#   │   └── gencode.v49.basic.annotation.gtf.gz
+#   ├── hs/chm13/            # Human T2T-CHM13
+#   │   ├── salmon/
+#   │   ├── star/
+#   │   └── chm13v2.0.gtf.gz
+#   ├── mm/vM38/             # Mouse GRCm39
+#   │   ├── salmon/
+#   │   ├── star/
+#   │   └── gencode.vM38.basic.annotation.gtf.gz
+#   ├── fly/                 # Drosophila BDGP6.54
+#   │   ├── salmon/
+#   │   ├── star/
+#   │   └── Drosophila_melanogaster.BDGP6.54.63.gtf.gz
+#   └── cel/                 # C. elegans WBcel235
 #       ├── salmon/
 #       ├── star/
-#       └── chm13v2.0.gtf.gz
+#       └── Caenorhabditis_elegans.WBcel235.63.gtf.gz
+
+# ============================= Advanced Options =============================
+# Paths can be overridden explicitly if your project uses non-default names.
+# (defaults reproduce the bash pipeline layout: <outdir>/03_salmon, <outdir>/05_featurecounts)
+# salmon_dir: result/03_salmon
+# bam_count_dir: result/05_featurecounts
+# gtf_file: /path/to/annotation.gtf.gz

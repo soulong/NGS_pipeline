@@ -723,7 +723,7 @@ p_l <- mle_data_norm_sig_L %>%
   scale_color_viridis_c() +
   geom_vline(xintercept=0, linetype=2) +
   geom_hline(yintercept=0, linetype=2) +
-  my_theme(0) +
+  my_theme(axis_text_x_angle = 0) +
   theme(legend.position="top")
 p_h <- mle_data_norm_sig_H %>% 
   ggplot(aes(APP_H, NOTCH1_H, color=Gal4DBD_H)) +
@@ -732,7 +732,7 @@ p_h <- mle_data_norm_sig_H %>%
   scale_color_viridis_c() +
   geom_vline(xintercept=0, linetype=2) +
   geom_hline(yintercept=0, linetype=2) +
-  my_theme(0) +
+  my_theme(axis_text_x_angle = 0) +
   theme(legend.position="top")
 ggsave(str_glue("{mle_dir}/{Sys.Date()}_mle_compare_betapdf"),
        p_l | p_h, width=7, height=4)

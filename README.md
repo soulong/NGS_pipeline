@@ -4,24 +4,16 @@ Next-generation sequencing (NGS) data analysis pipelines for RNA-seq, CUT&Tag, a
 
 ## Installation
 
-### 1. Clone Repository
+### Clone Repository
 ```bash
 git clone https://github.com/soulong/NGS_pipeline.git
 cd ngs_pipeline
 ```
 
-### 2. Create Conda Environment
+### Create Conda Environment
 ```bash
 conda env create -f environment.yml
 conda activate ngs
-```
-
-### 3. Verify Installation
-```bash
-# Check core tools
-salmon --version
-star --version
-bowtie2 --version
 ```
 
 ## Quick Start
@@ -31,8 +23,11 @@ bowtie2 --version
 # Navigate to your dataset
 cd /path/to/dataset
 
+# Generate samplesheet
+bash /path/to/ngs_pipeline/RNAseq/run_rnaseq.sh config.yml
+
 # Run pipeline
-bash /path/to/ngs_pipeline/RNAseq/RNAseq_Step_1_Run.sh config.yml
+bash /path/to/ngs_pipeline/RNAseq/run_rnaseq.sh config.yml
 ```
 
 ### CUT&Tag Analysis
@@ -52,9 +47,8 @@ bash /path/to/ngs_pipeline/CRISPR/MAGeCK_run.sh
 
 ## Requirements
 
-- **OS:** Linux/macOS
+- **OS:** Linux/Windows(via WSL)
 - **RAM:** ≥16GB (≥64GB recommended for STAR)
-- **Storage:** ≥50GB per RNA-seq sample
 
 ## License
 

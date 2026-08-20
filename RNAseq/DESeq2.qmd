@@ -27,7 +27,7 @@ params:
 # options("repos" = c(CRAN = "http://mirrors.tuna.tsinghua.edu.cn/CRAN/"))
 # options(BioC_mirror = "http://mirrors.tuna.tsinghua.edu.cn/bioconductor")
 script_path <- rstudioapi::getActiveDocumentContext()$path |> dirname()
-source(file.path(script_path, "RNAseq_helper.R"))
+source(file.path(script_path, "rnaseq_helper.R"))
 
 # knitr::opts_knit$set(root.dir=dirname(f_path))
 setwd(params$root_dir)
@@ -41,8 +41,6 @@ samplesheet <- params$samplesheet
 counts_file_suffix <- params$counts_file_suffix
 deseq2_dir <- params$deseq2_dir
 quantification_dir <- params$quantification_dir
-run_DEG_pattern <- params$run_DEG_pattern
-save_Rdata <- params$save_Rdata
 
 if(!dir.exists(deseq2_dir)) dir.create(deseq2_dir)
 

@@ -19,13 +19,19 @@ params:
   mm_gtf_file: "D:\\index\\hs\\vM38\\gencode.vM38.basic.annotation.gtf.gz"
 ---
 
+> **Deprecated (reference only).** This R document is superseded by
+> `RNAseq/quantification.py` (built on `pytximport`), which has been merged
+> into `run_rnaseq.sh` as **Phase 4: Quantification**.
+> Run `python quantification.py config.yml` (or just run the bash pipeline) to
+> produce the same date-stamped xlsx files in `<root>/quantification/`.
+> Kept here for reference.
 
 ## Setup
 ```{r setup, include=FALSE, cache=FALSE}
 # options("repos"=c(CRAN="http://mirrors.tuna.tsinghua.edu.cn/CRAN/"))
 # options(BioC_mirror="http://mirrors.tuna.tsinghua.edu.cn/bioconductor")
 script_path <- rstudioapi::getActiveDocumentContext()$path |> dirname()
-source(file.path(script_path, "RNAseq_helper.R"))
+source(file.path(script_path, "rnaseq_helper.R"))
 
 # knitr::opts_knit$set(root.dir=dirname(f_path))
 setwd(params$root_dir)

@@ -132,9 +132,10 @@ setup_trap() {
 }
 
 clear_trap() {
-    # Clear interrupt traps, combinated with SIGINT and SIGTERM (with setup_trap more often)
+    # Clear interrupt traps, combined with SIGINT and SIGTERM (with setup_trap more often)
+    # Restore default handlers so Ctrl-C keeps working for the remainder of the script
     # Usage: clear_trap
-    trap '' SIGINT SIGTERM
+    trap - SIGINT SIGTERM
 }
 
 # ============================= File Processing =============================
@@ -345,23 +346,36 @@ calculate_scale_factor() {
             ;;
         SpikeFree)
             if [[ -z "$spike_free_file" || ! -f "$spike_free_file" ]]; then
-                die "SpikeFree method requires spike-free scale factor file"
+                die "SpikeFree method requires spike-free scale factor file: $spike_free_file"
             fi
-            
+
+            # Locate the "SF" column by header name (file layout:
+            #   ID, GROUP, ANTIBODY, COLOR, QC, SF, TURNS) and read it for this sample.
             local sf_raw
             sf_raw=$(awk -F'\t' -v s="$sample" '
+                NR==1 {
+                    for (i = 1; i <= NF; i++) if ($i == "SF") { sf_col = i; break }
+                    if (!sf_col) { print "__NO_SF_COL"; exit }
+                }
                 NR>1 {
                     gsub(/\.filtered\.bam$/, "", $1)
-                    if ($1 == s) { print $7; exit }
+                    if ($1 == s) { print $sf_col; exit }
                 }
             ' "$spike_free_file")
-            
-            if [[ -z "$sf_raw" ]]; then
-                die "Sample $sample not found in $spike_free_file"
+
+            if [[ -z "$sf_raw" || "$sf_raw" == "__NO_SF_COL" ]]; then
+                die "Sample $sample not found (or no SF column) in $spike_free_file"
             fi
-            
-            scale_factor=$(awk -v fr="$filtered_reads" -v sf="$sf_raw" \
-                'BEGIN{printf "%.6f", 1e6 / (fr * sf)}')
+            if [[ "$sf_raw" == "NA" ]] || ! [[ "$sf_raw" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                die "Sample $sample has invalid or missing (NA) scaling factor in $spike_free_file"
+            fi
+            if [[ $filtered_reads -le 0 || "$sf_raw" == "0" ]]; then
+                log_warn "Filtered reads ($filtered_reads) or SF ($sf_raw) is zero, using scale factor 1.0"
+                scale_factor="1.000000"
+            else
+                scale_factor=$(awk -v fr="$filtered_reads" -v sf="$sf_raw" \
+                    'BEGIN{printf "%.6f", 1e6 / (fr * sf)}')
+            fi
             ;;
         *)
             log_error "Unknown normalization method: $method"

@@ -33,7 +33,8 @@ parse_yaml_config() {
     local config="$1"
     
     # Simple YAML parser (handles key: value pairs)
-    declare -a CUSTOM_BED_REGIONS=()
+    # -g so CUSTOM_BED_REGIONS survives function return and is consumed in main()
+    declare -ga CUSTOM_BED_REGIONS=()
     while IFS=': ' read -r key value || [[ -n "$key" ]]; do
         # Skip comments and empty lines
         [[ "$key" =~ ^[[:space:]]*# ]] && continue
@@ -61,6 +62,9 @@ parse_yaml_config() {
             macs_parameter) MACS_PARAMETER="$value" ;;
             run_spike) RUN_SPIKE="$value" ;;
             norm_method) NORM_METHOD="$value" ;;
+            heatmap_binsize) HEATMAP_BINSIZE="$value" ;;
+            heatmap_max_regions) HEATMAP_MAX_REGIONS="$value" ;;
+            pca_ntop) PCA_NTOP="$value" ;;
             index_rootdir) INDEX_ROOTDIR="$value" ;;
             spike_free_sf_file) SPIKE_FREE_SF_FILE="$value" ;;
             bed_region) 
@@ -218,7 +222,13 @@ run_alignment() {
     fi
     
     # Calculate normalization scale factor
-    local spike_free_file="$ALIGN_DIR/SpikeFree_SF.txt"
+    local spike_free_file
+    if [[ -n "${SPIKE_FREE_SF_FILE:-}" ]]; then
+        spike_free_file="$SPIKE_FREE_SF_FILE"
+        [[ "$spike_free_file" != /* ]] && spike_free_file="$ROOT_DIR/$spike_free_file"
+    else
+        spike_free_file="$ALIGN_DIR/SpikeFree_SF.txt"
+    fi
     local scale_factor
     scale_factor=$(calculate_scale_factor "$NORM_METHOD" "$filtered_reads" "$spike_reads" "$sample" "$spike_free_file")
     log_info "[$sample] Normalization: $NORM_METHOD, Scale factor: $scale_factor"
@@ -227,7 +237,7 @@ run_alignment() {
     generate_bigwig "$sample" "$scale_factor"
     
     # Append to statistics (frip will be updated later)
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$sample" "$group" "$control" "$target" "$fq1" "$fq2" \
         "$total_reads" "$mapped_reads" "$duplicate_reads" "$filtered_reads" \
         "$spike_reads" "$NORM_METHOD" "$scale_factor" >> "$STATS_CSV"
@@ -366,14 +376,27 @@ profile_heatmap() {
     local bed_name=$(basename "$bed_file" .bed)
     log_info "[Heatmap QC] $prefix ($type) over $bed_name"
     
+    # Subsample large BED files to bound matrix memory usage
+    local region_count=$(wc -l < "$bed_file")
+    local heatmap_bed="$bed_file"
+    if [[ -n "$HEATMAP_MAX_REGIONS" && "$region_count" -gt "$HEATMAP_MAX_REGIONS" ]]; then
+        log_warn "[Heatmap QC] $bed_name has $region_count regions, subsampling to $HEATMAP_MAX_REGIONS (fixed seed)"
+        heatmap_bed="$MULTIQC_DIR/${bed_name}_${prefix}_subsampled_${HEATMAP_MAX_REGIONS}.bed"
+        if [[ ! -s "$heatmap_bed" ]]; then
+            # deterministic subsample: 'yes' provides a reproducible random source
+            shuf --random-source=<(yes | head -c 10000000) -n "$HEATMAP_MAX_REGIONS" "$bed_file" \
+                | sort -k1,1 -k2,2n > "$heatmap_bed"
+        fi
+    fi
+    
     # TSS heatmap
     if [[ "$type" == "tss" || "$type" == "both" ]]; then
         local heatmap_tss="$MULTIQC_DIR/${bed_name}_${prefix}_tss_${NORM_METHOD}_heatmap.pdf"
         if [[ ! -s "$heatmap_tss" ]]; then
             local mat_tss="$MULTIQC_DIR/${bed_name}_${prefix}_tss_${NORM_METHOD}_mat.gz"
             [[ ! -s "$mat_tss" ]] && \
-                computeMatrix reference-point --referencePoint TSS -S "${bw_array[@]}" -R "$bed_file" \
-                    -o "$mat_tss" -p "$THREADS" -b 3000 -a 3000 --skipZeros \
+                computeMatrix reference-point --referencePoint TSS -S "${bw_array[@]}" -R "$heatmap_bed" \
+                    -o "$mat_tss" -p "$THREADS" -b 3000 -a 3000 --binSize "$HEATMAP_BINSIZE" --skipZeros \
                     --samplesLabel "${name_array[@]}" --quiet >/dev/null
             plotHeatmap -m "$mat_tss" -out "$heatmap_tss" --colorMap Blues >/dev/null
         fi
@@ -385,8 +408,8 @@ profile_heatmap() {
         if [[ ! -s "$heatmap_center" ]]; then
             local mat_center="$MULTIQC_DIR/${bed_name}_${prefix}_center_${NORM_METHOD}_mat.gz"
             [[ ! -s "$mat_center" ]] && \
-                computeMatrix reference-point --referencePoint center -S "${bw_array[@]}" -R "$bed_file" \
-                    -o "$mat_center" -p "$THREADS" -b 3000 -a 3000 --skipZeros \
+                computeMatrix reference-point --referencePoint center -S "${bw_array[@]}" -R "$heatmap_bed" \
+                    -o "$mat_center" -p "$THREADS" -b 3000 -a 3000 --binSize "$HEATMAP_BINSIZE" --skipZeros \
                     --samplesLabel "${name_array[@]}" --quiet >/dev/null
             plotHeatmap -m "$mat_center" -out "$heatmap_center" --colorMap Blues >/dev/null
         fi
@@ -398,7 +421,7 @@ profile_heatmap() {
     #     local mat_body="$MULTIQC_DIR/${bed_name}_${prefix}_body_${NORM_METHOD}_mat.gz"
     #     [[ ! -s "$mat_body" ]] && \
     #         computeMatrix scale-regions -S "${bw_array[@]}" -R "$bed_file" \
-    #             -o "$mat_body" -p "$THREADS" -b 3000 -a 3000 --skipZeros \
+    #             -o "$mat_body" -p "$THREADS" -b 3000 -a 3000 --binSize "$HEATMAP_BINSIZE" \
     #             --regionBodyLength 5000 --samplesLabel "${name_array[@]}" \
     #             --quiet 2>/dev/null
     #     plotHeatmap -m "$mat_body" -out "$heatmap_body" --colorMap Blues 2>/dev/null
@@ -459,7 +482,14 @@ bigwig_qc() {
     # PCA plot
     if [[ ! -s "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_PCA.pdf" ]]; then
         log_info "[BigWig QC] Generating PCA"
-        plotPCA -in "$npz_file" -o "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_PCA.pdf" >/dev/null
+        python "$SCRIPT_DIR/../scripts/plot_pca.py" -in "$npz_file" \
+            -o "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_PCA.pdf" \
+            --outFileNameData "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_PCA.tab" \
+            --ntop "$PCA_NTOP" --plotTitle "$prefix" \
+            --samplesheet "$SAMPLESHEET" >/dev/null 2>&1 || {
+                log_warn "plot_pca.py failed, falling back to plotPCA"
+                plotPCA -in "$npz_file" -o "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_PCA.pdf" >/dev/null
+            }
     fi
     
     # Correlation heatmap
@@ -561,8 +591,25 @@ run_global_qc() {
 main() {
     local config_file="${1:-}"
 
+    # Defaults for optional keys (protect against unset under `set -u`;
+    # applied before parse_yaml_config because it reads MACS_PARAMETER)
+    SKIP_PREPROCESS="${SKIP_PREPROCESS:-false}"
+    CALL_PEAK="${CALL_PEAK:-true}"
+    RUN_SPIKE="${RUN_SPIKE:-false}"
+    NORM_METHOD="${NORM_METHOD:-CPM}"
+    MACS_PARAMETER="${MACS_PARAMETER:-}"
+    SORT_MEM_LIMIT="${SORT_MEM_LIMIT:-8G}"
+    MAX_FRAG_LENGTH="${MAX_FRAG_LENGTH:-2000}"
+    THREADS="${THREADS:-8}"
+
     # Load configuration
     parse_yaml_config "$config_file"
+    
+    # Defaults for heatmap options (if not set in config)
+    HEATMAP_BINSIZE="${HEATMAP_BINSIZE:-50}"
+    HEATMAP_MAX_REGIONS="${HEATMAP_MAX_REGIONS:-100000}"
+    PCA_NTOP="${PCA_NTOP:-100000}"
+    log_info "  Heatmap bin size: $HEATMAP_BINSIZE (max regions: $HEATMAP_MAX_REGIONS, PCA ntop: $PCA_NTOP)"
     
     # Check dependencies
     require_commands fastqc fastp bowtie2 sambamba samtools macs3 deeptools bedtools multiqc
@@ -582,6 +629,12 @@ main() {
 
     # Setup genome
     setup_genome "$SPECIES" "$INDEX_ROOTDIR"
+
+    # Append custom BED regions (bed_region key in config.yml)
+    if [[ ${#CUSTOM_BED_REGIONS[@]} -gt 0 ]]; then
+        log_info "Adding ${#CUSTOM_BED_REGIONS[@]} custom BED region(s) to heatmap QC"
+        BED_REGIONS+=("${CUSTOM_BED_REGIONS[@]}")
+    fi
 
     # Check samplesheet
     if [[ ! -s "$SAMPLESHEET" ]]; then

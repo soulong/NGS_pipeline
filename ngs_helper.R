@@ -38,7 +38,7 @@ detect_os <- function() {
 #' @param standardize Logical; whether to convert Windows paths to WSL format (default: TRUE)
 #' @param os Character; the operating system (default: auto-detect)
 #' @return Character string with normalized path
-norm_path <- function(path=r"(C:\Users\haohe\GitHub\shinyLab)", 
+norm_path <- function(path, 
                       standardize=TRUE, 
                       os=detect_os()
 ) {

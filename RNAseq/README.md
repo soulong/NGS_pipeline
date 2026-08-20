@@ -7,26 +7,58 @@
 
 ## Example usage
 ```
-script_dir=/mnt/c/Users/haohe/GitHub/myScript/NGS/RNAseq
-dataset_dir=/mnt/d/2026-01-01_CutTag_dataset
+script_dir=/mnt/c/Users/haohe/GitHub/NGS_pipeline/RNAseq
+dataset_dir=/mnt/d/2026-01-01_RNAseq_dataset
 
 # Enter dataset directory
 cd $dataset_dir
 
+# mamba activate ngs
+
 # Run to generate samplesheet.csv
-bash $script_dir/run_cuttag.sh config.yml
+bash $script_dir/run_rnaseq.sh config.yml
 
 # Edit samplesheet.csv
 # Edit config.yml
 
-# Re-run pipeline
-bash $script_dir/run_cuttag.sh config.yml
+# Re-run pipeline (trimming → Salmon → optional STAR/featureCounts →
+# Python quantification → MultiQC)
+bash $script_dir/run_rnaseq.sh config.yml
 ```
+
+## Pipeline stages
+Run entirely inside `run_rnaseq.sh` (no R needed until differential analysis):
+
+| Phase | Step | Tool |
+| ----- | ---- | ---- |
+| 1 | Pre-processing (trimming) | fastp |
+| 2 | Salmon quantification | Salmon |
+| 3 | STAR alignment + featureCounts (optional, `run_star`/`run_featurecounts`) | STAR, featureCounts |
+| 4 | Transcript/gene quantification → xlsx | `quantification.py` (pytximport) |
+| 5 | QC | MultiQC |
+
+## Quantification output
+Phase 4 runs `RNAseq/quantification.py` (a `pytximport` reimplementation of the
+deprecated `deprecated_Quantification.qmd`). It writes date-stamped xlsx
+files to `<root>/quantification/`:
+
+- `<date>_gene_expression.xlsx` — sheets `tpm` & `counts`
+  (columns: `ensembl_id, symbol, type, <samples>`) — consumed by `DESeq2.qmd`
+  and `Enrichment.qmd`
+- `<date>_transcript_expression.xlsx` — transcript-level equivalents
+- `<date>_gene_expression_bam.xlsx` — only if featureCounts output exists
+
+Can also be run standalone: `python quantification.py config.yml`
+(skips if today's `_gene_expression.xlsx` already exists).
+
+## Downstream analysis in R (RStudio)
+1. `DESeq2.qmd` — read the generated xlsx, run DESeq2, save DEG tables & plots.
+2. `Enrichment.qmd` — ORA/GSEA, ssGSEA, etc.
 
 ## Outputs
 - QC reports and trimmed FASTQs
 - Aligned BAMs or quasi-mapping outputs
-- Gene/Transcript-level count tables
+- Gene/Transcript-level count/TPM tables (xlsx)
 - logs
 
 ## Notes

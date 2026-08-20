@@ -77,6 +77,23 @@ index_rootdir: /mnt/d/index
 #       └── bowtie2/
 
 # ============================= Advanced Options =============================
+# Heatmap resolution for computeMatrix (bp per bin).
+# Larger values reduce memory and runtime for big BED files:
+#   memory ~= n_regions * n_samples * (window_size / binsize) * 8 bytes
+#   50 bp: 100k regions x 30 samples x 120 bins ~= 3 GB (safe default)
+#   10 bp: 100k regions x 30 samples x 600 bins ~= 14 GB (can OOM)
+# heatmap_binsize: 50
+
+# Maximum number of BED regions used for heatmap computation.
+# Larger BED files (e.g. consensus peaks of many samples) are subsampled
+# to this many regions (fixed seed, reproducible) to bound memory/runtime.
+# heatmap_max_regions: 100000
+
+# Number of top most-variable genomic bins used for PCA (default 100000).
+# Larger values keep more genome-wide signal; smaller values focus on
+# high-variance regions (faster). Set to 0 to use all bins.
+# pca_ntop: 100000
+
 # Custom BED regions for heatmap generation (one per line, will be added to defaults)
 # path should be absolute path
 # Format: bed_region: /path/to/file.bed

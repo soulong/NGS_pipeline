@@ -4,6 +4,16 @@ library(furrr)
 library(clusterProfiler)
 library(ComplexHeatmap)
 
+
+#' @param counts a numeric vector of raw counts (e.g. a sample column)
+#' @param lengths a numeric vector of gene/transcript lengths
+#' @return transcripts per million (TPM), rounded to 2 decimals
+get_tpm <- function(counts, lengths) {
+  rate <- counts / lengths
+  return(round(rate / sum(rate) * 1e6, 2))
+}
+
+
 #' @param df a data.frame
 #' @param group named vector, names are columns in df, values are groups
 #' @param threshold min threshold to keep

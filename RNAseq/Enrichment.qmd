@@ -19,8 +19,6 @@ params:
   wald_test_suffix: "_wald_result.xlsx" 
   expr_file_suffix: "_norm_expression.xlsx"
   quantification_dir: "quantification"
-  # pathway of interest for individual analysis
-  pathway_of_interest: ["HALLMARK_MYC_TARGETS_V1", "HALLMARK_MYC_TARGETS_V2"]
 --- 
 
 # Setup
@@ -28,7 +26,7 @@ params:
 # options("repos" = c(CRAN = "http://mirrors.tuna.tsinghua.edu.cn/CRAN/"))
 # options(BioC_mirror = "http://mirrors.tuna.tsinghua.edu.cn/bioconductor")
 script_path <- rstudioapi::getActiveDocumentContext()$path |> dirname()
-source(file.path(script_path, "RNAseq_helper.R"))
+source(file.path(script_path, "rnaseq_helper.R"))
 
 # knitr::opts_knit$set(root.dir=dirname(f_path))
 setwd(params$root_dir)
@@ -220,8 +218,12 @@ if(T) {
 
 ### mark gene
 ```{r}
+# pathway of interest for individual analysis
+pathway_of_interest <- c("HALLMARK_MYC_TARGETS_V1", 
+                         "HALLMARK_MYC_TARGETS_V2")
+
 # mark gene
-pathway <- params$pathway_of_interest
+pathway <- pathway_of_interest
 mark_gene <- list_flatten(genesets) %>% 
   .[str_detect(names(.), "term2gene")] %>% 
   list_rbind() %>% 

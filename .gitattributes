@@ -1,0 +1,13 @@
+# Force LF line endings on checkout for pipeline files (fixes WSL bash $'\r' errors)
+*               text=auto
+.gitattributes  text eol=lf
+*.sh    text eol=lf
+*.py    text eol=lf
+*.R     text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.csv   text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.qmd   text eol=lf
+*.json  text eol=lf

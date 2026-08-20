@@ -1,0 +1,301 @@
+---
+title: "Exomeseq Derived Variants Analysis"
+author: "Hao He"
+date: "`r Sys.time()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_setions: yes
+
+params:
+  save_Rdata: FALSE
+  # run_DEGs_pattern: TRUE
+  species: "hs" # hs or mm
+  # deg_padj: 0.1
+  # deg_fc: 1.5
+  # deg_mincount: 100
+  maf_file_suffix: ".maf" # suffix of vcf file
+  maf_dir: "variant" # output directory of bam
+  sample_info_file: "sample_info.xlsx" # sample info file located in root_dir
+--- 
+
+
+```{r, include=FALSE}
+# options("repos" = c(CRAN = "http://mirrors.tuna.tsinghua.edu.cn/CRAN/"))
+# options(BioC_mirror = "http://mirrors.tuna.tsinghua.edu.cn/bioconductor")
+
+knitr::opts_chunk$set(echo = TRUE, results = "hold", cache = TRUE)
+# Sys.setlocale(category = "LC_ALL", locale = "Chinese")
+```
+  
+  
+```{r setup}
+# load packages
+if(!"pacman" %in% installed.packages()) install.packages("pacman")
+pacman::p_load(tidyverse, maftools)
+
+species <- params$species
+# deg_padj <- params$deg_padj
+# deg_fc <- params$deg_fc
+# deg_mincount <- params$deg_mincount
+maf_file_suffix <- params$maf_file_suffix
+maf_dir <- params$maf_dir
+sample_info_file <- params$sample_info_file
+# quantification_dir <- params$quantification_dir
+# run_DEGs_pattern <- params$run_DEGs_pattern
+save_Rdata <- params$save_Rdata
+
+print(str_glue("species: {species}"))
+# print(str_glue("deg_padj: {deg_padj}"))
+# print(str_glue("deg_fc: {deg_fc}"))
+# print(str_glue("deg_mincount: {deg_mincount}"))
+```
+
+## read merged maf
+```{r, include=F}
+maf <- read.maf('variant/merged.maf')
+# maf <- merge_mafs(c('variant/parental.maf', 'variant/resist.maf'))
+getSampleSummary(maf)
+getGeneSummary(maf)
+lollipopPlot(maf, gene='KRAS', AACol='HGVSp_Short', labelPos='all', repel=F)
+lollipopPlot2(subsetMaf(maf, tsb='parental'), 
+              subsetMaf(maf, tsb='resist'), 
+              gene='KRAS', 
+              m1_name='parent', m2_name='resist', 
+              AACol1='HGVSp_Short', AACol2='HGVSp_Short', 
+              m1_label='all', m2_label='all')
+
+oncoplot(maf, showTumorSampleBarcodes=F, top=50, 
+         fontSize=0.4, 
+         clinicalFeatures='resist_AMG510', sortByAnnotation=T)
+```
+
+
+## read indivual maf
+```{r}
+sample_info <- readxl::read_excel(sample_info_file, sheet=1) %>%
+  dplyr::rename(Tumor_Sample_Barcode=project_id)
+
+maf_files <- list.files('variant', '.maf', full.names=T, recursive=T)
+maf_files <- str_subset(maf_files, 'merge', negate=T) # remove ant merged maf files
+print(maf_files)
+
+# read maf files all in one
+maf <- merge_mafs(maf_files, clinicalData=sample_info)
+
+
+# save
+saveRDS(maf, str_glue('variant/{Sys.Date()}_maf.rds'))
+
+maf@data %>%
+  as_tibble() %>%
+  dplyr::select(!any_of(cytominer::drop_na_columns(maf@data, variables=colnames(maf@data)))) %>%
+  dplyr::select(!c(all_effects)) %>%
+  # glimpse()
+  write_csv(str_glue('{Sys.Date()}_maf_result.csv'))
+#   # writexl::write_xlsx(str_glue('variant/{Sys.Date()}_maf_result.xlsx'))
+
+# summary
+maf@data %>% glimpse()
+getSampleSummary(maf)
+getGeneSummary(maf)
+
+
+# filter only missense/ mutation
+maf@data <- maf@data %>%
+  filter(Variant_Classification)
+plotVaf(maf, genes=c('FAT1'))
+
+pdf(str_glue('{Sys.Date()}_maf_summary.pdf'), width=10, height=7, useDingbats=F)
+plotmafSummary(maf, showBarcodes=T)
+dev.off()
+
+getClinicalData(maf)
+getFields(maf)
+
+# plot all
+oncoplot(maf, showTumorSampleBarcodes=T, genes=c('KRAS','TP53','PTEN','FAT1'), 
+         clinicalFeatures=c('resist_AMG510'), sortByAnnotation=T)
+
+oncoplot(maf, showTumorSampleBarcodes=F, top=25, 
+         fontSize=0.4, 
+         clinicalFeatures='resist_AMG510', sortByAnnotation=T)
+
+math.score(maf)
+somaticInteractions(maf, top=25, pvalue=c(0.005, 0.5))
+
+
+# mut matrix
+maf@data$Variant_Classification %>% unique()
+mut_mat <- mutCountMatrix(maf, countOnly=setdiff(unique(maf@data$Variant_Classification), 'Nonsense_Mutation'))
+mut_mat_scale <- t(apply(mut_mat, 1, scale))
+colnames(mut_mat_scale) <- colnames(mut_mat)
+mut_mat_scale <- mut_mat_scale[rowSums(is.na(mut_mat_scale)) < 1, ]
+
+# plot 
+pdf(str_glue('{Sys.Date()}_maf_correlation.pdf'), width=10, height=7, useDingbats=F)
+corrplot::corrplot(cor(mut_mat, method='pearson'), tl.col='grey10', title='pearson')
+corrplot::corrplot(cor(mut_mat, method='spearman'), tl.col='grey10', title='spearman')
+dev.off()
+
+pdf(str_glue('{Sys.Date()}_maf_heatmap.pdf'), width=7, height=7, useDingbats=F)
+anno_cols <- data.frame(row.names=sample_info$Tumor_Sample_Barcode, 
+                        type=sample_info$resist_AMG510)
+pheatmap::pheatmap(mut_mat_scale, scale='none', main='clustering with euclidean distance',
+                   clustering_distance_rows='euclidean', clustering_distance_cols='euclidean',
+                   show_rownames=F, annotation_col=anno_cols)
+pheatmap::pheatmap(mut_mat_scale, scale='none', main='clustering with manhattan distance',
+                   clustering_distance_rows='manhattan', clustering_distance_cols='manhattan',
+                   show_rownames=F, annotation_col=anno_cols)
+dev.off()
+
+
+
+# mut allel frequency matrix
+glimpse(maf@data)
+mut_af <- maf@data %>%
+  as_tibble() %>%
+  transmute(Tumor_Sample_Barcode=Tumor_Sample_Barcode,
+            Hugo_Symbol=Hugo_Symbol, 
+            Variant_Classification=Variant_Classification,
+            dbSNP_RS=dbSNP_RS,
+            HGVSp_Short=HGVSp_Short,
+            t_depth=t_depth,
+            t_af=as.integer(t_alt_count)/as.integer(t_depth)) %>%
+  mutate(t_af=replace_na(t_af, 0))
+# to wide by sample
+mut_af_wide <- mut_af %>%
+  pivot_wider(names_from=Tumor_Sample_Barcode,
+              values_from=c(t_af, t_depth)) %>%
+  mutate(across(starts_with('t_'), ~ replace_na(.x, 0))) %>%
+  filter(`t_depth_H358P-1-LFB5873_L0` > 20 | `t_depth_H358R-2-LFB5874_L0` > 20)
+write_csv(mut_af_wide, str_glue('{Sys.Date()}_maf_allel_frequency.csv'))
+
+mut_af_wide %>%
+  filter(Hugo_Symbol=='MUC4', dbSNP_RS=='rs2550253')
+
+
+pdf(str_glue('{Sys.Date()}_maf_allel_frequency_heatmap.pdf'), width=4, height=9, useDingbats=F)
+anno_cols <- data.frame(row.names=sample_info$Tumor_Sample_Barcode, 
+                        type=sample_info$resist_AMG510)
+mut_af_wide %>%
+  dplyr::select(1,4,5,6) %>%
+  unite('id', Hugo_Symbol, HGVSp_Short, sep='_') %>%
+  distinct(id, .keep_all=T) %>%
+  column_to_rownames('id') %>%
+  pheatmap::pheatmap(scale='none', main='clustering with euclidean distance',
+                     clustering_distance_rows='euclidean', clustering_distance_cols='euclidean',
+                     show_rownames=F)
+dev.off()
+
+pdf(str_glue('{Sys.Date()}_maf_allel_frequency_heatmap_filter_depth.pdf'), width=4, height=9, useDingbats=F)
+anno_cols <- data.frame(row.names=sample_info$Tumor_Sample_Barcode, 
+                        type=sample_info$resist_AMG510)
+mut_af_wide %>%
+  filter(`t_depth_H358P-1-LFB5873_L0` > 20 & `t_depth_H358R-2-LFB5874_L0` > 20) %>%
+  dplyr::select(1,4,5,6) %>%
+  unite('id', Hugo_Symbol, HGVSp_Short, sep='_') %>%
+  distinct(id, .keep_all=T) %>%
+  column_to_rownames('id') %>%
+  pheatmap::pheatmap(scale='none', main='clustering with euclidean distance',
+                     clustering_distance_rows='euclidean', clustering_distance_cols='euclidean',
+                     show_rownames=F)
+dev.off()
+
+```
+
+## compare
+```{r}
+##### subset
+parent <- subsetMaf(maf, tsb=c('H358P-1-LFB5873_L0'))
+resist <- subsetMaf(maf, tsb=c('H358R-2-LFB5874_L0'))
+
+lollipopPlot2(parent, resist, 
+              gene='ASB16', labPosAngle=90, labPosSize=0.8,
+              m1_name='parent', m2_name='resist', 
+              AACol1='HGVSp_Short', AACol2='HGVSp_Short', 
+              m1_label='all', m2_label='all')
+
+plotVaf(parent)
+plotVaf(resist)
+
+pdf(str_glue('{Sys.Date()}_rainfall_parent.pdf'), width=15, height=7)
+rainfallPlot(parent, pointSize=0.1, ref.build='hg38')
+dev.off()
+pdf(str_glue('{Sys.Date()}_rainfall_resist.pdf'), width=15, height=7)
+rainfallPlot(resist, pointSize=0.1, ref.build='hg38')
+dev.off()
+
+
+## compare two sets
+# method 1
+resist_vs_parent <- mafCompare(parent, resist, 'parent', 'resist', minMut=2, useCNV=F)
+writexl::write_xlsx(resist_vs_parent$results, str_glue('{Sys.Date()}_compare_result.xlsx'))
+forestPlot(resist_vs_parent, pVal=0.05,  geneFontSize=0.4)
+diff_mut_genes <- resist_vs_parent$results %>%
+  mutate(ratio=resist/parent) %>%
+  filter(ratio>1) %>%
+  filter(pval < 0.01)
+
+# method 2
+resist_vs_parent_ce <- clinicalEnrichment(maf, clinicalFeature='resist_AMG510', minMut=2, useCNV=F)
+diff_mut_genes <- resist_vs_parent_ce$groupwise_comparision %>%
+  mutate(ratio=1/OR, pval=p_value) %>%
+  filter(ratio>1) %>%
+  filter(pval < 0.01)
+
+
+# plot comparison
+pdf(str_glue('{Sys.Date()}_compare_oncoplot.pdf'), width=7, height=7, useDingbats=F)
+oncoplot(maf, showTumorSampleBarcodes=F, 
+         genes=diff_mut_genes$Hugo_Symbol, 
+         fontSize=0.2, anno_height=0.5, sortByMutation=T,
+         clinicalFeatures=c('resist_AMG510','treat'), sortByAnnotation=T)
+coOncoplot(parent, resist, diff_mut_genes$Hugo_Symbol, 'parent', 'resist',
+           geneNamefont=0.2, 
+           # sortByAnnotation1=T, sortByAnnotation2=T,
+           clinicalFeatures1='treat', clinicalFeatures2='treat')
+dev.off()
+
+
+for(i in c('KRAS', 'FAT2')) {
+  pdf(str_glue('{Sys.Date()}_compare_indiviual_{i}.pdf'), width=9, height=5, useDingbats=F)
+  lollipopPlot2(parent, resist, gene=i, m1_name='parent', m2_name='resist', 
+                AACol1='HGVSp_Short', AACol2='HGVSp_Short', 
+                m1_label='all', m2_label='all'
+                )
+  dev.off() }
+
+# onco-pathway
+onco_pathways <- OncogenicPathways(maf)
+ggplot(onco_pathways, aes(N, n_affected_genes)) +
+  geom_point(size=4) +
+  ggrepel::geom_label_repel(aes(label=Pathway)) +
+  labs(x='Pathway Size', y='# Affected genes') +
+  theme_bw()
+cowplot::ggsave2(str_glue('{Sys.Date()}_compare_oncopathway_summary.pdf'), width=6, height=4)
+
+for(i in onco_pathways$Pathway) {
+  pdf(str_glue('{Sys.Date()}_compare_oncopathway_{i}.pdf'), width=9, height=5, useDingbats=F)
+  PlotOncogenicPathways(maf, pathways=i, showTumorSampleBarcodes=T,
+                        sampleOrder=maf@clinical.data$Tumor_Sample_Barcode)
+  dev.off() }
+
+
+# oncodrive
+drive_genes <- oncodrive(resist, minMut=2, pvalMethod='zscore')
+plotOncodrive(drive_genes, fdrCutOff = 0.25, useFraction = TRUE, labelSize = 0.5)
+
+
+oncoplot(maf, showTumorSampleBarcodes=F, 
+         genes=c('KRAS', 'FAT2', 'MUC4'), 
+         fontSize=0.2, anno_height=0.5, sortByMutation=T,
+         clinicalFeatures=c('resist_AMG510'), sortByAnnotation=T)
+
+coBarplot(parent, resist, diff_mut_genes$Hugo_Symbol, orderBy = NULL, 'parent', 'resist')
+
+vafCompare(parent, resist, genes=diff_mut_genes$Hugo_Symbol[1:10])
+
+```
+
