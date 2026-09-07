@@ -173,16 +173,23 @@ generate_samplesheet() {
     # Write header
     printf "sample,group,control,target,fq1,fq2\n" > "$output_csv"
     
-    # Find R1 files and infer R2
+    # Find all paired-end FASTQ files; the read marker is the LAST _R?[12] segment
+    # before the extension (e.g. Sample_1_1.fq.gz, Sample_S1_L001_R1_001.fastq.gz)
     find "$input_dir" -type f -regextype posix-extended \
-        -regex '.*_[rR]?1(_.*)?\.f(ast)?q\.gz' | sort | while IFS= read -r fq1; do
+        -regex '.*_[rR]?[12](_[0-9]+)?\.f(ast)?q\.gz' | sort | while IFS= read -r fq1; do
         
-        local fq1_dir fq1_base fq2_base fq2
+        local fq1_dir fq1_base fq2_base fq2 read_num sample_name
         fq1_dir=$(dirname "$fq1")
         fq1_base=$(basename "$fq1")
         
-        # Convert R1 to R2
-        fq2_base=$(echo "$fq1_base" | sed -E 's/^(.*)(_[rR]?)1((_.*)?\.f(ast)?q\.gz)$/\1\22\3/')
+        # Read number = the LAST _R?[12] segment before the extension (greedy .*)
+        read_num=$(echo "$fq1_base" | sed -E 's/^.*_([rR]?[12])(_[0-9]+)?\.f(ast)?q\.gz$/\1/')
+        case "$read_num" in
+            [rR]2|2) continue ;;  # skip R2 files, they are paired from R1
+        esac
+        
+        # Convert R1 to R2 (anchored, greedy prefix -> converts the last _R?1 segment)
+        fq2_base=$(echo "$fq1_base" | sed -E 's/^(.*_)([rR]?)1((_[0-9]+)?\.f(ast)?q\.gz)$/\1\22\3/')
         fq2="$fq1_dir/$fq2_base"
         
         if [[ ! -f "$fq2" ]]; then
@@ -190,12 +197,16 @@ generate_samplesheet() {
             fq2="NA"
         fi
         
-        # Extract sample name by removing common suffixes
-        local sample_name
-        sample_name=$(basename "$fq1" | sed -E 's/_R?1(_.*)?\.f(ast)?q\.gz$//')
+        # Extract sample name = everything before the read-marker segment
+        sample_name=$(echo "$fq1_base" | sed -E 's/^(.*)_[rR]?1(_[0-9]+)?\.f(ast)?q\.gz$/\1/')
         
         printf "%s,,,,%s,%s\n" "$sample_name" "$fq1" "$fq2" >> "$output_csv"
     done
+    
+    # Natural sort (version sort) by sample name, keep header first
+    local tmp="${output_csv}.tmp"
+    { head -n 1 "$output_csv"; tail -n +2 "$output_csv" | sort -t, -k1,1 -V; } > "$tmp"
+    mv "$tmp" "$output_csv"
     
     log_info "Generated samplesheet: $output_csv"
 }

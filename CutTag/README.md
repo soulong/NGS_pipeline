@@ -36,7 +36,7 @@ bash $script_dir/run_cuttag.sh config.yml
 
 ## Heatmap options (config.yml)
 - `heatmap_binsize` (default `50`) — bp per bin for `computeMatrix`. Larger values reduce memory and runtime for big BED files: memory ≈ n_regions × n_samples × (window/binsize) × 8 bytes. 100k regions × 30 samples × 120 bins ≈ 3 GB at binSize 50.
-- `heatmap_max_regions` (default `100000`) — BED files with more regions (e.g. consensus peaks from many samples) are deterministically subsampled (fixed random source) to bound matrix size. Subsampled BED is cached in `result/multiqc/`.
+- `heatmap_max_regions` (default `100000`) — BED files with more regions (e.g. consensus peaks from many samples) are deterministically subsampled (fixed random source) to bound matrix size. Subsampled BED is cached in the corresponding heatmap output directory (e.g. `result/multiqc/` for global QC, `04_peaks/<tool>/` for peak QC).
 - All samples stay in a single matrix (one row per BED region, samples side-by-side), so groups remain directly comparable in one heatmap.
 
 ## PCA (config.yml)

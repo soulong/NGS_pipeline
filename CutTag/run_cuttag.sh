@@ -58,8 +58,9 @@ parse_yaml_config() {
             skip_preprocess) SKIP_PREPROCESS="$value" ;;
             sort_mem_limit) SORT_MEM_LIMIT="$value" ;;
             max_frag_length) MAX_FRAG_LENGTH="$value" ;;
-            call_peak) CALL_PEAK="$value" ;;
+            peak_caller) PEAK_CALLER="$value" ;;
             macs_parameter) MACS_PARAMETER="$value" ;;
+            seacr_parameter) SEACR_PARAMETER="$value" ;;
             run_spike) RUN_SPIKE="$value" ;;
             norm_method) NORM_METHOD="$value" ;;
             heatmap_binsize) HEATMAP_BINSIZE="$value" ;;
@@ -167,6 +168,10 @@ bam_filter() {
                 chr_filter='rname =~ "^(2[LR]|3[LR]|4|X|Y)$"'
                 ;;
         esac
+        if [[ -z "${chr_filter:-}" ]]; then
+            log_error "[$sample] Unsupported species '$SPECIES' in bam_filter (supported: chm13, hs, mm, cel, fly)"
+            exit 1
+        fi
         log_info "[$sample] Filtering BAM (MAPQ≥30, proper pairs, main chromosomes)"
         samtools view -@ "$THREADS" -b -f 2 -q 30 -F 1804 \
             -e "$chr_filter" \
@@ -236,7 +241,8 @@ run_alignment() {
     # Generate BigWig
     generate_bigwig "$sample" "$scale_factor"
     
-    # Append to statistics (frip will be updated later)
+    # Append to statistics (FRiP is written per-tool during peak QC:
+    # 04_peaks/<tool>/consensus_<target>_frip.tab via plotEnrichment)
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$sample" "$group" "$control" "$target" "$fq1" "$fq2" \
         "$total_reads" "$mapped_reads" "$duplicate_reads" "$filtered_reads" \
@@ -244,17 +250,42 @@ run_alignment() {
 }
 
 # ============================= Peak Calling =============================
+# Find the peak file produced by a caller for a given sample.
+# Usage: discover_peak_file <tool> <sample> <tool_peak_dir> [stringency]
+# Safe under `set -euo pipefail`: never relies on a failing `ls` pipeline and
+# always returns 0 (empty string when no peak file exists yet).
+discover_peak_file() {
+    local tool="$1" sample="$2" peak_dir="$3"
+    local -a globs=()
+    case "$tool" in
+        macs)
+            globs=("$peak_dir"/${sample}*_peaks.*Peak) ;;
+        seacr)
+            # Prefer the peak matching the current config stringency when
+            # several (.relaxed/.stringent) files coexist from previous runs
+            local pref=""
+            [[ -n "${4:-}" ]] && pref=".${4}"
+            globs=("$peak_dir"/${sample}${pref}.bed "$peak_dir"/${sample}.*.bed)
+            ;;
+    esac
+    local f
+    for f in "${globs[@]}"; do
+        [[ -f "$f" ]] && { echo "$f"; return 0; }
+    done
+    return 0
+}
+
 run_macs() {
     local sample="$1" group="$2" control="$3" target="$4"
     
     local filtered_bam="$ALIGN_DIR/${sample}.filtered.bam"
-    local peak_file="$PEAK_DIR/${sample}${PEAK_EXT}"
+    local peak_file="$TOOL_PEAK_DIR/${sample}${PEAK_EXT}"
     
     if [[ ! -s "$peak_file" ]]; then
         log_info "[$sample] Running macs"
         
         # Build MACS3 arguments
-        local -a macs_args=("-t" "$filtered_bam" "-f" "BAMPE" "-g" "$GSIZE" "-n" "$PEAK_DIR/${sample}" "--keep-dup" "all")
+        local -a macs_args=("-t" "$filtered_bam" "-f" "BAMPE" "-g" "$GSIZE" "-n" "$TOOL_PEAK_DIR/${sample}" "--keep-dup" "all")
         # Split MACS parameters string into array and append
         read -ra macs_params_arr <<< "$MACS_PARAMETER"
         macs_args+=("${macs_params_arr[@]}")
@@ -268,23 +299,118 @@ run_macs() {
             fi
         fi
         
-        macs3 callpeak "${macs_args[@]}" 2>/dev/null
+        macs3 callpeak "${macs_args[@]}" 2>/dev/null || \
+            log_warn "[$sample] macs3 callpeak failed"
+        # Remove bulky intermediate; keep xls/summits as small useful outputs
+        rm -f "$TOOL_PEAK_DIR/${sample}_control_lambda.bdg"
     else
         log_info "[$sample] Call peak completed"
     fi
+}
+
+run_seacr() {
+    local sample="$1" group="$2" control="$3" target="$4"
+    
+    # Parse positional SEACR args: <threshold> <norm|non> <relaxed|stringent>
+    read -ra seacr_params_arr <<< "$SEACR_PARAMETER"
+    local threshold="${seacr_params_arr[0]:-0.01}"
+    local norm_mode="${seacr_params_arr[1]:-non}"
+    local stringency="${seacr_params_arr[2]:-stringent}"
+    
+    local peak_file="$TOOL_PEAK_DIR/${sample}.${stringency}.bed"
+    if [[ -s "$peak_file" ]]; then
+        log_info "[$sample] SEACR peak completed"
+        return 0
+    fi
+    
+    # SEACR needs 4-column bedgraph input derived from the filtered BAM.
+    # Generated with deepTools bamCoverage (multi-threaded, raw counts;
+    # equivalent signal to `bedtools genomecov -bg` but much faster).
+    local tempdir="$TOOL_PEAK_DIR/.tmp_bg"
+    mkdir -p "$tempdir"
+    # Drop stale bedgraphs (e.g. from an aborted run with a different generator)
+    rm -f "$tempdir"/*.bg* 2>/dev/null
+    local exp_bg="$tempdir/${sample}.bg"
+    local exp_tmp="$tempdir/${sample}.bg.tmp"
+    if [[ ! -s "$exp_bg" ]]; then
+        bamCoverage -b "$ALIGN_DIR/${sample}.filtered.bam" -o "$exp_tmp" \
+            --outFileFormat bedgraph --binSize 1 \
+            -p "$THREADS" --minMappingQuality 0 2>/dev/null && \
+            mv -f "$exp_tmp" "$exp_bg" || {
+                log_warn "[$sample] bamCoverage failed, skipping SEACR for this sample"
+                rm -f "$exp_tmp"
+                return 0
+            }
+    fi
+    [[ -s "$exp_bg" ]] || {
+        log_warn "[$sample] empty bedgraph, skipping SEACR for this sample"
+        return 0
+    }
+    
+    local -a seacr_args=("$exp_bg")
+    local ctrl_bg=""
+    if [[ -n "$control" ]]; then
+        ctrl_bg="$tempdir/${control}.bg"
+        if [[ ! -s "$ctrl_bg" ]]; then
+            local ctrl_tmp="$tempdir/${control}.bg.tmp"
+            bamCoverage -b "$ALIGN_DIR/${control}.filtered.bam" -o "$ctrl_tmp" \
+                --outFileFormat bedgraph --binSize 1 \
+                -p "$THREADS" --minMappingQuality 0 2>/dev/null && \
+                mv -f "$ctrl_tmp" "$ctrl_bg" || {
+                    log_warn "[$sample] bamCoverage failed for control: $control"
+                    rm -f "$ctrl_tmp"
+                    ctrl_bg=""
+                }
+        fi
+        if [[ -s "$ctrl_bg" ]]; then
+            seacr_args+=("$ctrl_bg")
+        else
+            log_warn "[$sample] Control bedgraph not generated for: $control"
+        fi
+    fi
+    # No control -> use the numeric threshold from SEACR_PARAMETER
+    if [[ ${#seacr_args[@]} -eq 1 ]]; then
+        seacr_args+=("$threshold")
+    fi
+    seacr_args+=("$norm_mode" "$stringency" "$TOOL_PEAK_DIR/${sample}")
+    
+    log_info "[$sample] Running SEACR"
+    ( cd "$tempdir" && SEACR_1.3.sh "${seacr_args[@]}" ) || \
+        log_warn "[$sample] SEACR failed"
+    
+    # Cleanup temp bedgraphs. NOTE: this must be the function exit path with
+    # status 0 — a `[[ -n $x ]] && rm ...` ending would return 1 for no-control
+    # samples and silently abort the whole pipeline under `set -e`.
+    rm -f "$exp_bg" "$ctrl_bg"
+    return 0
 } 
 
 # ============================= Peak Consensus =============================
+# Usage: run_consensus <tool>
 run_consensus() {
+    local tool="$1"
+    local peak_dir="$PEAK_DIR/$tool/peak"
+    local plot_dir="$PEAK_DIR/$tool"
+
+    # SEACR peak filenames carry the stringency (relaxed/stringent) from config;
+    # prefer the file matching the current setting when several coexist.
+    local stringency=""
+    if [[ "$tool" == "seacr" ]]; then
+        read -ra seacr_params_arr <<< "$SEACR_PARAMETER"
+        stringency="${seacr_params_arr[2]:-stringent}"
+    fi
+
     # Collect samples by target
     declare -A target_peaks
     declare -a all_peak_files
+    local n_targets=0
 
     while IFS=, read -r sample group control target fq1 fq2 || [[ -n "${sample:-}" ]]; do
         [[ "$sample" == "sample" ]] && continue
         [[ -z "$sample" ]] && continue
 
-        local peak_file="$PEAK_DIR/${sample}${PEAK_EXT}"
+        local peak_file
+        peak_file=$(discover_peak_file "$tool" "$sample" "$peak_dir" "$stringency")
         [[ ! -f "$peak_file" ]] && continue
 
         all_peak_files+=("$peak_file")
@@ -292,11 +418,18 @@ run_consensus() {
         if [[ -n "$target" ]]; then
             if [[ -z "${target_peaks[$target]:-}" ]]; then
                 target_peaks[$target]="$peak_file"
+                n_targets=$((n_targets + 1))
             else
                 target_peaks[$target]="${target_peaks[$target]} $peak_file"
             fi
         fi
     done < <(tail -n +2 "$SAMPLESHEET" | tr -d '\r')
+
+    if [[ "$n_targets" -eq 0 ]]; then
+        log_warn "[$tool] No usable peak files found for any target"
+        log_warn "        (no control library and/or no peaks called); consensus skipped"
+        return 0
+    fi
 
     # Create consensus for each target
     for target in "${!target_peaks[@]}"; do
@@ -309,26 +442,26 @@ run_consensus() {
             continue
         fi
 
-        local consensus_bed="${PEAK_DIR}/consensus_${target}.bed"
+        local consensus_bed="${plot_dir}/consensus_${target}.bed"
         if [[ ! -s "$consensus_bed" ]]; then
-            log_info "[$target] Make consensus from ${#peaks[@]} samples"
+            log_info "[$tool][$target] Make consensus from ${#peaks[@]} samples"
             # log_info "Samples: ${peaks[@]}"
             merge_peakfiles --input-peaks "${peaks[*]}" --output-bed "$consensus_bed" --chrom-size "$CHROM_SIZES" || \
                 { 
-                    log_warn "Failed to create consensus for: $target"
+                    log_warn "[$tool] Failed to create consensus for: $target"
                     continue
                 }
         else 
-            log_info "[$target] Consensus peak completed"
+            log_info "[$tool][$target] Consensus peak completed"
         fi
     done
 
     # Create consensus for all samples, only if N target > 1
-    if [[ ${#target_peaks[@]} -gt 1 ]] && [[ ! -s "${PEAK_DIR}/consensus_all.bed" ]]; then
-        local consensus_bed="${PEAK_DIR}/consensus_all.bed"
-        log_info "Creating consensus peaks for: all (${#all_peak_files[@]} samples)"
+    if [[ "$n_targets" -gt 1 ]] && [[ ! -s "${plot_dir}/consensus_all.bed" ]]; then
+        local consensus_bed="${plot_dir}/consensus_all.bed"
+        log_info "[$tool] Creating consensus peaks for: all (${#all_peak_files[@]} samples)"
         merge_peakfiles --input-peaks "${all_peak_files[*]}" --output-bed "$consensus_bed" --chrom-size "$CHROM_SIZES" || \
-            log_warn "Failed to create consensus for: all"
+            log_warn "[$tool] Failed to create consensus for: all"
     fi
 }
 
@@ -337,7 +470,8 @@ run_consensus() {
 calculate_frip() {
     local prefix="$1"
     local consensus_bed="$2"
-    shift 2
+    local outdir="$3"
+    shift 3
 
     local -a bam_array=("$@")
     if [[ ${#bam_array[@]} -eq 0 || ! -f "$consensus_bed" ]]; then
@@ -348,8 +482,8 @@ calculate_frip() {
         name_array+=("$(basename "$bam" .filtered.bam)")
     done
     
-    local frip_tab="$MULTIQC_DIR/consensus_${prefix}_frip.tab"
-    local frip_plot="$MULTIQC_DIR/consensus_${prefix}_frip.pdf"
+    local frip_tab="$outdir/consensus_${prefix}_frip.tab"
+    local frip_plot="$outdir/consensus_${prefix}_frip.pdf"
     if [[ ! -s "$frip_tab" ]]; then
         log_info "[QC] Computing FRiP: $prefix"
         plotEnrichment -p "$THREADS" -b "${bam_array[@]}" \
@@ -362,7 +496,8 @@ profile_heatmap() {
     local prefix="$1"
     local bed_file="$2"
     local type="$3"
-    shift 3
+    local outdir="$4"
+    shift 4
 
     local -a bw_array=("$@")
     if [[ ${#bw_array[@]} -eq 0 || ! -f "$bed_file" ]]; then
@@ -381,7 +516,7 @@ profile_heatmap() {
     local heatmap_bed="$bed_file"
     if [[ -n "$HEATMAP_MAX_REGIONS" && "$region_count" -gt "$HEATMAP_MAX_REGIONS" ]]; then
         log_warn "[Heatmap QC] $bed_name has $region_count regions, subsampling to $HEATMAP_MAX_REGIONS (fixed seed)"
-        heatmap_bed="$MULTIQC_DIR/${bed_name}_${prefix}_subsampled_${HEATMAP_MAX_REGIONS}.bed"
+        heatmap_bed="$outdir/${bed_name}_${prefix}_subsampled_${HEATMAP_MAX_REGIONS}.bed"
         if [[ ! -s "$heatmap_bed" ]]; then
             # deterministic subsample: 'yes' provides a reproducible random source
             shuf --random-source=<(yes | head -c 10000000) -n "$HEATMAP_MAX_REGIONS" "$bed_file" \
@@ -391,9 +526,9 @@ profile_heatmap() {
     
     # TSS heatmap
     if [[ "$type" == "tss" || "$type" == "both" ]]; then
-        local heatmap_tss="$MULTIQC_DIR/${bed_name}_${prefix}_tss_${NORM_METHOD}_heatmap.pdf"
+        local heatmap_tss="$outdir/${bed_name}_${prefix}_tss_${NORM_METHOD}_heatmap.pdf"
         if [[ ! -s "$heatmap_tss" ]]; then
-            local mat_tss="$MULTIQC_DIR/${bed_name}_${prefix}_tss_${NORM_METHOD}_mat.gz"
+            local mat_tss="$outdir/${bed_name}_${prefix}_tss_${NORM_METHOD}_mat.gz"
             [[ ! -s "$mat_tss" ]] && \
                 computeMatrix reference-point --referencePoint TSS -S "${bw_array[@]}" -R "$heatmap_bed" \
                     -o "$mat_tss" -p "$THREADS" -b 3000 -a 3000 --binSize "$HEATMAP_BINSIZE" --skipZeros \
@@ -404,9 +539,9 @@ profile_heatmap() {
 
     # Center heatmap
     if [[ "$type" == "center" || "$type" == "both" ]]; then
-        local heatmap_center="$MULTIQC_DIR/${bed_name}_${prefix}_center_${NORM_METHOD}_heatmap.pdf"
+        local heatmap_center="$outdir/${bed_name}_${prefix}_center_${NORM_METHOD}_heatmap.pdf"
         if [[ ! -s "$heatmap_center" ]]; then
-            local mat_center="$MULTIQC_DIR/${bed_name}_${prefix}_center_${NORM_METHOD}_mat.gz"
+            local mat_center="$outdir/${bed_name}_${prefix}_center_${NORM_METHOD}_mat.gz"
             [[ ! -s "$mat_center" ]] && \
                 computeMatrix reference-point --referencePoint center -S "${bw_array[@]}" -R "$heatmap_bed" \
                     -o "$mat_center" -p "$THREADS" -b 3000 -a 3000 --binSize "$HEATMAP_BINSIZE" --skipZeros \
@@ -503,10 +638,11 @@ bigwig_qc() {
 
 run_global_qc() {
     # Collect all samples organized by target
-    # Collect samples organized by target
     # Populates: TARGET_SAMPLES (associative array)
-    declare -gA TARGET_SAMPLES
-    declare -ga ALL_SAMPLES ALL_BAMS ALL_BWS ALL_TARGETS
+    # NOTE: `declare -g` does NOT clear already-global arrays, so reset them
+    # explicitly; otherwise samples accumulate across prior peak-QC calls.
+    declare -gA TARGET_SAMPLES=()
+    declare -ga ALL_SAMPLES=() ALL_BAMS=() ALL_BWS=() ALL_TARGETS=()
     while IFS=, read -r sample group control target fq1 fq2 || [[ -n "${sample:-}" ]]; do
         [[ "$sample" == "sample" ]] && continue
         [[ -z "$sample" ]] && continue
@@ -537,7 +673,6 @@ run_global_qc() {
     
     log_info "Found ${#ALL_SAMPLES[@]} samples across ${#ALL_TARGETS[@]} targets"
     
-
     # BAM-level QC (all samples)
     bam_qc "${ALL_BAMS[@]}"
     
@@ -546,44 +681,79 @@ run_global_qc() {
     
     # Heatmaps for all samples over genomic regions
     for bed_file in "${BED_REGIONS[@]}"; do
-        [[ -f "$bed_file" ]] && profile_heatmap "all_samples" "$bed_file" "both" "${ALL_BWS[@]}"
+        [[ -f "$bed_file" ]] && profile_heatmap "all_samples" "$bed_file" "both" "$MULTIQC_DIR" "${ALL_BWS[@]}"
     done
+    
+    # MultiQC (non-peak QC stays in the multiqc/ directory)
+    log_info "[Multi QC] Generating MultiQC report"
+    multiqc "$OUTDIR" --force -o "$MULTIQC_DIR" --title "CUT&Tag Analysis" 2>/dev/null || true
+}
 
-    # Target-specific consensus peak QC
+# Per-tool peak QC: FRiP + heatmaps over this tool's consensus peaks,
+# written directly under 04_peaks/<tool>/. The single MultiQC report is
+# generated later in Phase 4 (run_global_qc), scanning the whole OUTDIR.
+# Usage: run_peak_qc <tool>
+run_peak_qc() {
+    local tool="$1"
+    local peak_dir="$PEAK_DIR/$tool/peak"
+    local plot_dir="$PEAK_DIR/$tool"
+
+    # Collect samples organized by target (same logic as run_global_qc)
+    # NOTE: `declare -g` does NOT clear already-global arrays, so reset them
+    # explicitly; otherwise samples accumulate across tool calls (duplicates).
+    declare -gA TARGET_SAMPLES=()
+    declare -ga ALL_SAMPLES=() ALL_BAMS=() ALL_BWS=() ALL_TARGETS=()
+    while IFS=, read -r sample group control target fq1 fq2 || [[ -n "${sample:-}" ]]; do
+        [[ "$sample" == "sample" ]] && continue
+        [[ -z "$sample" ]] && continue
+        
+        local bam="$ALIGN_DIR/${sample}.filtered.bam"
+        local bw="$ALIGN_DIR/${sample}.${NORM_METHOD}.bw"
+        
+        [[ ! -f "$bam" ]] && continue
+        
+        ALL_SAMPLES+=("$sample")
+        ALL_BAMS+=("$bam")
+        ALL_BWS+=("$bw")
+        
+        if [[ -n "$target" ]]; then
+            if [[ -z "${TARGET_SAMPLES[$target]:-}" ]]; then
+                TARGET_SAMPLES[$target]="$sample"
+                ALL_TARGETS+=("$target")
+            else
+                TARGET_SAMPLES[$target]="${TARGET_SAMPLES[$target]} $sample"
+            fi
+        fi
+    done < <(tail -n +2 "$SAMPLESHEET" | tr -d '\r')
+    
+    if [[ ${#ALL_SAMPLES[@]} -eq 0 ]]; then
+        log_warn "[$tool] No samples found for peak QC"
+        return 0
+    fi
+    
+    # Consensus peak QC per target
     for target in "${ALL_TARGETS[@]}"; do
-        # Get samples for this target
-        local -a target_samples=() target_bams=() target_bws=()
+        local -a target_bams=() target_bws=()
         read -ra target_samples <<< "${TARGET_SAMPLES[$target]}"
         for sample in "${target_samples[@]}"; do
             target_bams+=("$ALIGN_DIR/${sample}.filtered.bam")
             target_bws+=("$ALIGN_DIR/${sample}.${NORM_METHOD}.bw")
         done
 
-        # # Heatmaps for target
-        # for bed_file in "${BED_REGIONS[@]}"; do
-        #     [[ -f "$bed_file" ]] && profile_heatmap "$target" "$bed_file" "center" "${target_bws[@]}"
-        # done
-        
-        # Consensus peak heatmap and FRiP for target
-        local target_consensus="$PEAK_DIR/consensus_${target}.bed"
+        local target_consensus="$plot_dir/consensus_${target}.bed"
         if [[ -f "$target_consensus" ]]; then
-            calculate_frip "$target" "$target_consensus" "${target_bams[@]}"
-            profile_heatmap "$target" "$target_consensus" "center" "${target_bws[@]}"
+            calculate_frip "$target" "$target_consensus" "$plot_dir" "${target_bams[@]}"
+            profile_heatmap "$target" "$target_consensus" "center" "$plot_dir" "${target_bws[@]}"
         fi
     done
     
-    # All-samples consensus peak QC, If only one target, skip
+    # All-samples consensus peak QC, only if >1 target
     if [[ ${#ALL_TARGETS[@]} -gt 1 ]]; then
-        local all_consensus="$PEAK_DIR/consensus_all.bed"
+        local all_consensus="$plot_dir/consensus_all.bed"
         if [[ -f "$all_consensus" ]]; then
-            calculate_frip "all" "$all_consensus" "${ALL_BAMS[@]}"
-            # profile_heatmap "all" "$all_consensus" "center" "${ALL_BWS[@]}"
+            calculate_frip "all" "$all_consensus" "$plot_dir" "${ALL_BAMS[@]}"
         fi
     fi
-    
-    # MultiQC
-    log_info "[Multi QC] Generating MultiQC report"
-    multiqc "$OUTDIR" --force -o "$MULTIQC_DIR" --title "CUT&Tag Analysis" 2>/dev/null || true
 }
 
 
@@ -592,12 +762,13 @@ main() {
     local config_file="${1:-}"
 
     # Defaults for optional keys (protect against unset under `set -u`;
-    # applied before parse_yaml_config because it reads MACS_PARAMETER)
+    # applied before parse_yaml_config because it reads PEAK_CALLER)
     SKIP_PREPROCESS="${SKIP_PREPROCESS:-false}"
-    CALL_PEAK="${CALL_PEAK:-true}"
+    PEAK_CALLER="${PEAK_CALLER:-}"
     RUN_SPIKE="${RUN_SPIKE:-false}"
     NORM_METHOD="${NORM_METHOD:-CPM}"
     MACS_PARAMETER="${MACS_PARAMETER:-}"
+    SEACR_PARAMETER="${SEACR_PARAMETER:-}"
     SORT_MEM_LIMIT="${SORT_MEM_LIMIT:-8G}"
     MAX_FRAG_LENGTH="${MAX_FRAG_LENGTH:-2000}"
     THREADS="${THREADS:-8}"
@@ -605,23 +776,44 @@ main() {
     # Load configuration
     parse_yaml_config "$config_file"
     
+    # Parse peak_caller into a normalized tool list (comma/space separated)
+    PEAK_CALLERS=()
+    if [[ -n "$PEAK_CALLER" && "$PEAK_CALLER" != "null" && "$PEAK_CALLER" != "~" ]]; then
+        IFS=', ' read -ra _pc_arr <<< "$PEAK_CALLER"
+        for _t in "${_pc_arr[@]}"; do
+            [[ -z "$_t" ]] && continue
+            case "$_t" in
+                macs|macs2) PEAK_CALLERS+=("macs") ;;
+                seacr)      PEAK_CALLERS+=("seacr") ;;
+                *)          log_warn "Unknown peak caller '$_t' ignored (supported: macs, seacr)" ;;
+            esac
+        done
+    fi
+    
     # Defaults for heatmap options (if not set in config)
     HEATMAP_BINSIZE="${HEATMAP_BINSIZE:-50}"
     HEATMAP_MAX_REGIONS="${HEATMAP_MAX_REGIONS:-100000}"
     PCA_NTOP="${PCA_NTOP:-100000}"
     log_info "  Heatmap bin size: $HEATMAP_BINSIZE (max regions: $HEATMAP_MAX_REGIONS, PCA ntop: $PCA_NTOP)"
     
-    # Check dependencies
-    require_commands fastqc fastp bowtie2 sambamba samtools macs3 deeptools bedtools multiqc
+    # Check dependencies (peak-caller binaries are checked per-tool in Phase 3)
+    require_commands fastqc fastp bowtie2 sambamba samtools deeptools bedtools multiqc
 
     # set path
     OUTDIR="$ROOT_DIR/$OUTDIR"
     FASTQ_DIR="$ROOT_DIR/$FASTQ_DIR"
     SAMPLESHEET="$ROOT_DIR/$SAMPLESHEET"
 
-    # Setup logging
+    # Setup logging: keep a copy of the original terminal stdout (fd3), then send
+    # all output to the log file; the pipeline's own [date-time]-prefixed
+    # messages are echoed to the terminal via fd3 (tool chatter stays in the
+    # log only). log_* are redefined below to duplicate the message to both.
+    exec 3>&1
     local log_file="$ROOT_DIR/pipeline.log"
-    exec > >(tee -a "$log_file") 2>&1
+    exec > >(cat >> "$log_file") 2>&1
+    log_info() { echo "[$(date '+%Y-%m-%d %H:%M')] [INFO] $*" | tee /dev/stderr >&3; }
+    log_warn() { echo "[$(date '+%Y-%m-%d %H:%M')] [WARN] $*" | tee /dev/stderr >&3; }
+    log_error() { echo "[$(date '+%Y-%m-%d %H:%M')] [ERROR] $*" | tee /dev/stderr >&3; }
     
     log_info "============================================================"
     log_info "CUT&Tag Analysis Pipeline"
@@ -670,7 +862,7 @@ EOF
     log_info "  Samplesheet: $SAMPLESHEET"
     log_info "  Threads: $THREADS"
     log_info "  Normalization: $NORM_METHOD"
-    log_info "  Peak calling: $CALL_PEAK ($MACS_PARAMETER)"
+    log_info "  Peak calling: ${PEAK_CALLER:-none}"
     log_info "  Spike-in: $RUN_SPIKE"
     log_info "============================================================"
     
@@ -691,16 +883,29 @@ EOF
     create_dirs "$ALIGN_DIR"
     loop_over_csv "$SAMPLESHEET" run_alignment
     
-    # Phase 3: Peak Calling
-    if [[ "$CALL_PEAK" == true ]]; then
-        log_info ""
-        log_info "========== Phase 3: Peak Calling =========="
+    # Phase 3: Peak Calling (per selected tool)
+    if [[ ${#PEAK_CALLERS[@]} -gt 0 ]]; then
         create_dirs "$PEAK_DIR"
-        loop_over_csv "$SAMPLESHEET" run_macs
-        
-        # Consensus Peaks
-        log_info "========== Consensus Peaks =========="
-        run_consensus
+        for tool in "${PEAK_CALLERS[@]}"; do
+            TOOL_PEAK_DIR="$PEAK_DIR/$tool/peak"
+            TOOL_PLOT_DIR="$PEAK_DIR/$tool"
+            create_dirs "$TOOL_PEAK_DIR" "$TOOL_PLOT_DIR"
+            
+            case "$tool" in
+                macs)   require_commands macs3 ;;
+                seacr)  require_commands SEACR_1.3.sh ;;
+            esac
+            
+            log_info ""
+            log_info "========== Phase 3: Peak Calling ($tool) =========="
+            loop_over_csv "$SAMPLESHEET" "run_${tool}"
+            
+            log_info "========== Consensus Peaks ($tool) =========="
+            run_consensus "$tool"
+            
+            log_info "========== Peak QC ($tool) =========="
+            run_peak_qc "$tool"
+        done
     fi
     
     # Phase 4: QC

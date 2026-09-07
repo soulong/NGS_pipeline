@@ -14,11 +14,11 @@ options(future.globals.maxSize=2 * 1024^3)  # 2GB if needed
 
 
 # config ------------
-setwd("D:\\EED_CutTag\\fly\\result")
+setwd("D:\\EED_CutTag\\cel_08-25\\result")
 # setwd("F:/workspace/J009_IMR_0_0.3_0.6/result")
 
-# txdb <- TxDb.Celegans.UCSC.ce11.refGene
-txdb <- TxDb.Dmelanogaster.UCSC.dm6.ensGene
+txdb <- TxDb.Celegans.UCSC.ce11.refGene
+# txdb <- TxDb.Dmelanogaster.UCSC.dm6.ensGene
 
 bam_dir <- "03_bam"
 peak_dir <- "04_peaks"
@@ -121,7 +121,7 @@ get_sample_stat <- function(
 
 
 # run ------------
-plan(multisession, workers=min(4, nrow(df))) 
+plan(multisession, workers=min(6, nrow(df))) 
 
 stats <- list()
 for(idx in seq_len(nrow(df))) {
@@ -158,7 +158,7 @@ writexl::write_xlsx(stats_tidy, glue::glue("{Sys.Date()}_stats_tidy.xlsx"))
 metrics <- colnames(stats_tidy)[18:21]
 plots <- map(metrics, ~ {
   stats_tidy %>%
-    separate_wider_delim(sample, delim="-", names=c("group","rep"), cols_remove=F) %>% 
+    separate_wider_delim(sample, delim="_", names=c("group","rep"), cols_remove=F) %>% 
     # mutate(sample_split=str_split(sample, "_", simplify=TRUE)) %>%
     # mutate(group=ifelse(ncol(sample_split) >= 2, sample_split[,1], sample)) %>%
     ggplot(aes(sample, .data[[.x]], fill=group)) +

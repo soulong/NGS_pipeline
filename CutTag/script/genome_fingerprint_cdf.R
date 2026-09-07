@@ -1,7 +1,7 @@
 
 library(tidyverse)
 
-setwd("D:\\EED_CutTag\\fly\\result")
+setwd("D:\\EED_CutTag\\cel_08-25\\result\\multiqc")
 
 raw <- read_delim('multiqc/BAM_fingerprint.txt', delim="\t", skip=1) %>% 
   janitor::clean_names() %>% 

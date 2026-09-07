@@ -2,13 +2,13 @@
 
 # ============================= Basic Settings =============================
 # root directory of project
-root_dir: "."
+root_dir: "/mnt/e/EED/2026-08-25_CutTag_cel"
 
 # Directory containing raw FASTQ files
 fastq_dir: 01.RawData
 
 # Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13), "fly" (Drosophila), "cel" (C. elegans)
-species: hs
+species: cel
 
 # Sample sheet CSV file (must contain columns: sample,group,control,target,fq1,fq2)
 samplesheet: samplesheet.csv
@@ -26,20 +26,26 @@ sort_mem_limit: 16G
 max_frag_length: 1000
 
 # Skip preprocessing steps, this is for running non-standard pipelines
-skip_preprocess: false
+skip_preprocess: true
 
 # Perform spike-in normalization alignment
-run_spike: false
+run_spike: true
 
 # Normalization method: "CPM" (counts per million), "Spike" (spike-in), or "SpikeFree"
 norm_method: CPM
 
-# Peak calling with MACS3
-call_peak: true
+# Peak calling tools: comma-separated subset of "macs, seacr" (any combination).
+# Empty/null -> skip peak calling. "macs" runs the "macs3" command.
+peak_caller: macs, seacr
 
-# MACS3 parameters used for peak calling. Example: "--nomodel --shift -100 --extsize 200 -q 0.01 --broad --broad-cutoff 0.05"
-# "-g hs -f BAMPE --keep-dup all" is already inlcued in script
+# MACS3 options only (e.g. --broad --nomodel). "-t/-c/-f BAMPE/-g/-n/--keep-dup all" are handled by script.
+# Note: "-g <genome size>" is set from the pipeline's own species table (helper.sh setup_genome).
 macs_parameter: -q 0.01 --broad --broad-cutoff 0.05
+
+# SEACR_1.3.sh positional args: <numeric threshold> <norm|non> <relaxed|stringent>.
+# When a control sample exists in the samplesheet, the control bedgraph replaces the threshold.
+# The experimental bedgraph (from filtered BAM) and the output prefix are handled by script.
+seacr_parameter: 0.05 non stringent
 
 # ============================= Index Paths =============================
 # Root directory containing genome indices
@@ -89,7 +95,7 @@ heatmap_binsize: 50
 # Maximum number of BED regions used for heatmap computation.
 # Larger BED files (e.g. consensus peaks of many samples) are subsampled
 # to this many regions (fixed seed, reproducible) to bound memory/runtime.
-heatmap_max_regions: 200000
+# heatmap_max_regions: 100000
 
 # Number of top most-variable genomic bins used for PCA (default 100000).
 # Larger values keep more genome-wide signal; smaller values focus on

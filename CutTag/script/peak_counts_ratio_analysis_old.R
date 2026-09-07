@@ -13,9 +13,10 @@ library(furrr)
 
 options(future.globals.maxSize=2 * 1024^3)  # 2GB if needed
 
-setwd("D:\\EED_CutTag\\fly\\result")
+setwd("D:\\EED_CutTag\\cel_08-25\\result")
 
-txdb <- TxDb.Dmelanogaster.UCSC.dm6.ensGene
+txdb <- TxDb.Celegans.UCSC.ce11.refGene
+# txdb <- TxDb.Dmelanogaster.UCSC.dm6.ensGene
 
 bam_dir <- "03_bam"
 peak_dir <- "04_peaks"
@@ -151,7 +152,7 @@ get_stats <- function(bam_path, peak_path,
 
 # ==== Run in parallel across samples ====
 # Flatten: one future per (sample, rep) is too fine; better: one future per sample
-plan(multisession, workers=min(10, nrow(df)))  # one worker per sample
+plan(multisession, workers=min(6, nrow(df)))  # one worker per sample
 
 stats <- future_map2(
   df$bam_file, df$peak_file,
@@ -191,7 +192,7 @@ summary_stats <- stats_tidy %>%
 metrics <- colnames(stats_tidy) %>% str_subset("_of_")
 plots <- map(metrics, ~ {
   stats_tidy %>%
-    separate_wider_delim(sample, delim="-", names=c("group","rep"), cols_remove=F) %>% 
+    separate_wider_delim(sample, delim="_", names=c("group","rep"), cols_remove=F) %>% 
     # mutate(sample_split=str_split(sample, "_", simplify=TRUE)) %>%
     # mutate(group=ifelse(ncol(sample_split) >= 2, sample_split[,1], sample)) %>%
     ggplot(aes(sample, .data[[.x]], fill=group)) +

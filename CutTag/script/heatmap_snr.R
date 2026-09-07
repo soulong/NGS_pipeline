@@ -21,8 +21,8 @@ library(data.table)
 library(jsonlite)
 
 # ============================== config ======================================
-mat_file <- "D:\\EED_CutTag\\c_elegans\\result\\multiqc\\consensus_H3K27me3_H3K27me3_center_CPM_mat.gz"
-out_dir  <- "D:\\EED_CutTag\\c_elegans\\result\\multiqc"
+mat_file <- "D:\\EED_CutTag\\cel_08-25\\result\\multiqc\\consensus_H3K27me3_H3K27me3_center_CPM_mat.gz"
+out_dir  <- "D:\\EED_CutTag\\cel_08-25\\result\\multiqc"
 
 center_width <- 1000    # bp around reference point = signal
 flank_width  <- 4000   # bp at outermost window edges = background
