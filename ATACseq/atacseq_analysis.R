@@ -9,18 +9,39 @@ library(DESeq2)
 library(TxDb.Hsapiens.UCSC.hg38.knownGene)
 require(org.Hs.eg.db)
 
-# load helper from parent directory
-parent_path <- rstudioapi::getActiveDocumentContext()$path |> 
-  dirname() |> dirname()
-source(file.path(parent_path, 'ngs_helper.R'))
+# locate this script (RStudio active document, Rscript --file=, or cwd);
+# ngs_helper.R lives in the parent directory
+if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+  doc <- rstudioapi::getActiveDocumentContext()$path
+  script_dir <- if (!is.null(doc) && nzchar(doc)) dirname(doc) else getwd()
+} else {
+  ca <- commandArgs(trailingOnly = FALSE)
+  fa <- grep("^--file=", ca, value = TRUE)
+  script_dir <- if (length(fa) > 0) dirname(normalizePath(sub("^--file=", "", fa[1]))) else getwd()
+}
+source(file.path(dirname(script_dir), 'ngs_helper.R'))
 
 
 # ============================= Configuration =============================
-data_dir <- norm_path(r"(E:\NGS\ATACseq_dataset\result)") %>% 
-  setwd()
+# Dataset result directory (produced by run_atacseq.sh).
+# Override via the ATACSEQ_RESULT_DIR environment variable if needed.
+data_dir <- Sys.getenv("ATACSEQ_RESULT_DIR",
+                       unset = norm_path(r"(E:\NGS\ATACseq_dataset\result)"))
+setwd(data_dir)
 
-annodb <- "org.Hs.eg.db"
-txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+# Annotation resources MUST match the genome the reads were aligned against.
+# NOTE: peaks aligned to chm13 (T2T) coordinates must NOT be annotated with
+# this hg38 TxDb (Mb-level coordinate differences) — align to hs/GRCh38 or
+# wire up a chm13-compatible TxDb here.
+species <- "hg38"
+anno_pkg <- switch(species,
+  hg38 = list(annodb = "org.Hs.eg.db",
+              txdb   = TxDb.Hsapiens.UCSC.hg38.knownGene),
+  stop("No annotation database wired up for species: ", species)
+)
+require(anno_pkg$annodb, character.only = TRUE)
+annodb <- anno_pkg$annodb
+txdb   <- anno_pkg$txdb
 
 set_style <- function(x) { 
   seqlevelsStyle(x) <- "UCSC"
@@ -41,18 +62,20 @@ geneset_interest <- c(
 
 
 # ============================= Import BigWig Files =============================
-# run used in heatmap profiling
-bw_suffix <- '.CPM.bw'
-bw_file <- '03_bam' %>% 
-  list.files(pattern=bw_suffix, full.names=T) %>%
-  set_names(., nm=map_chr(., \(x) basename(x) %>% 
-                            str_replace(fixed(bw_suffix),''))) %>% 
+# run used in heatmap profiling — pick up bigwigs from any normalization
+# the pipeline produced (config norm_method: CPM/Spike/SpikeFree)
+bw_file <- '03_bam' %>%
+  list.files(pattern='\\.(CPM|Spike|SpikeFree)\\.bw$', full.names=T) %>%
+  set_names(., nm=map_chr(., \(x) basename(x) %>%
+                            str_remove('\\.(CPM|Spike|SpikeFree)\\.bw$'))) %>%
   # subset samples (example: select specific groups)
-  # .[which(str_detect(names(.), 'WT|KO'))] %>% 
+  # .[which(str_detect(names(.), 'WT|KO'))] %>%
   print()
 
-# reorder as heatmap needs
-new_order <- names(bw_file)[order(factor(sapply(strsplit(names(bw_file), "_"), `[`, 2)))]
+# reorder as heatmap needs — natural sort on the 2nd "_"-token so numeric
+# series sort 2 < 10 (plain alphabetical order would give "10" < "2")
+group_token <- sapply(strsplit(names(bw_file), "_"), `[`, 2)
+new_order <- order(match(group_token, str_sort(unique(group_token), numeric = TRUE)))
 bw_file <- bw_file[new_order]
 
 # read bw
@@ -99,10 +122,12 @@ anno <- consensus %>%
                            annoDb=annodb) %>% 
   {.@anno}
 
-# Filter peaks near TSS of genes of interest
-consensus_filtered <- anno %>% 
-  {.[.$geneId %in% geneset_interest]} %>% 
-  {.[abs(.$distanceToTSS) <= 3000]} %>% 
+# Filter peaks near TSS of genes of interest.
+# NOTE: ChIPseeker's `geneId` column holds ENTREZ ids; gene SYMBOLs live in
+# the `SYMBOL` column. Matching symbols against geneId always yields empty.
+consensus_filtered <- anno %>%
+  {.[.$SYMBOL %in% geneset_interest]} %>%
+  {.[abs(.$distanceToTSS) <= 3000]} %>%
   print()
 
 
@@ -152,11 +177,14 @@ dds <- DESeqDataSetFromMatrix(
   count, col_data, design = ~ condition) %>% 
   DESeq()
 
-## Extract results
-dds_result <- results(dds, contrast=c("condition", "Knockout", "Control")) %>% 
-  as_tibble(rownames='uid') %>% 
-  separate(uid, c("seqnames","start","end","width"), sep="_") %>% 
-  arrange(pvalue) %>% 
+## Extract results.
+## uid was built from 3 fields (seqnames_start_end) — separating it into 4
+## names produced an all-NA `width` column.
+contrast_pair <- c("Knockout", "Control")   # adjust to your design
+dds_result <- results(dds, contrast=c("condition", contrast_pair[1], contrast_pair[2])) %>%
+  as_tibble(rownames='uid') %>%
+  separate(uid, c("seqnames","start","end"), sep="_") %>%
+  arrange(pvalue) %>%
   print()
 
 ## Annotate DARs (Differential Accessible Regions)
@@ -169,17 +197,18 @@ dds_result_gr_anno <- dds_result %>%
   { .@anno } %>% 
   print()
 
-## Tidy results for visualization
-deg_tidy <- as_tibble(dds_result_gr_anno) %>% 
+## Tidy results for visualization (SYMBOL, not the Entrez geneId, is matched
+## against the geneset symbols)
+deg_tidy <- as_tibble(dds_result_gr_anno) %>%
   mutate(
-    geneset_interest = ifelse(geneId %in% geneset_interest, geneId, NA),
+    geneset_hit = ifelse(SYMBOL %in% geneset_interest, SYMBOL, NA),
     type = case_when(
       log2FoldChange > log2(1.5) & padj < 0.05 ~ 'gain',
       log2FoldChange < log2(1/1.5) & padj < 0.05 ~ 'loss',
       TRUE ~ NA_character_
     ),
-    label = ifelse(!is.na(geneset_interest) & !is.na(type), geneset_interest, NA)
-  ) %>% 
+    label = ifelse(!is.na(geneset_hit) & !is.na(type), geneset_hit, NA)
+  ) %>%
   glimpse()
 
 dplyr::count(deg_tidy, type)
@@ -230,39 +259,41 @@ rois <- deg_tidy %>%
 for(idx in seq_along(rois)) {
   # region of interest
   roi <- rois[[idx]]
-  
+
   # calculate mat over signal
   mat_list <- compute_signal_matrix(
-    signal=soi, 
-    region=roi, 
+    signal=soi,
+    region=roi,
     mode='reference_point', reference_point="center",
     bin_size=50, scale='none'
   )
-  
-  # set rowname
-  consensus_rowname <- roi@elementMetadata %>% as_tibble() %>% 
-    mutate(uid=str_glue('{geneId}_{row_number()}'),.by=geneId) %>% 
+
+  # set rowname (SYMBOL + occurrence index so duplicate genes stay unique)
+  consensus_rowname <- roi@elementMetadata %>% as_tibble() %>%
+    mutate(uid=str_glue('{SYMBOL}_{row_number()}'),.by=SYMBOL) %>%
     pull(uid)
-  
-  # label genes of interest
-  labels <- str_subset(
-    consensus_rowname, paste0(geneset_interest, collapse="_|"))
-  
+
+  # label genes of interest — exact prefix match on the uid (SYMBOL_n);
+  # the old regex alternation (paste0(..., collapse="_|")) could never match
+  genes_in_rois <- str_replace(consensus_rowname, "_[0-9]+$", "")
+  labels <- consensus_rowname[genes_in_rois %in% geneset_interest]
+
   # plot
   result <- heatmap_profile(
     mat_list,
-    color_scales = c(0, NA), 
+    color_scales = c(0, NA),
     colors = c("white", "#b12923"),
     rownames=consensus_rowname,
     labels=labels
   )
-  
-  # save
+
+  # save (close only the device opened above, not every open device)
   f_name <- names(rois)[idx]
-  pdf(str_glue("{Sys.Date()}_heatmap_{f_name}.pdf"), 
+  pdf(str_glue("{Sys.Date()}_heatmap_{f_name}.pdf"),
       width = length(result$heatmap)*1.6, height = 8)
+  dev_id <- dev.cur()
   print(result$heatmap)
-  while(dev.cur() != 1) dev.off()
+  dev.off(dev_id)
 }
 
 
@@ -297,22 +328,44 @@ if(file.exists(frag_file)) {
 
 
 # ============================= TSS Enrichment Score =============================
-# Calculate TSS enrichment for each sample
+# TSS enrichment = signal at the TSS vs. the flanks of the +/-2kb promoter
+# window (standard ATACseq QC metric; ENCODE threshold ~ >5).
+# The promoters come from getPromoters(upstream=2000, downstream=2000), i.e.
+# the window ALREADY spans TSS-2000..TSS+2000, so normalizeToMatrix must use
+# extend=c(0,0) (adding another 2kb on each side would double the window).
+# Bin count depends on how normalizeToMatrix settles the bin width, so the
+# center/flank indices are derived from ncol() as fractions of the window:
+#   center = the middle bins straddling the TSS, flanks = outermost 10%/side.
 tss <- getPromoters(TxDb=txdb, upstream=2000, downstream=2000)
+
+bin_size <- 100
 
 tss_enrichment <- list()
 for(i in seq_along(bw)) {
   sample_name <- names(bw)[i]
   signal <- bw[[i]]
-  
-  # Calculate signal around TSS
-  tss_signal <- signalOverRegions(signal, tss, bin_size=100)
-  
+
+  # signal matrix over the promoter windows (one row per TSS)
+  tss_signal <- EnrichedHeatmap::normalizeToMatrix(
+    signal, tss,
+    value_column = "score",
+    extend = c(0, 0),
+    mean_mode = "w0",
+    w = bin_size
+  )
+
+  n_bin <- ncol(tss_signal)
+  half  <- n_bin %/% 2
+  center_ix   <- unique(round(half + c(-1.5, -0.5, 0.5, 1.5)))
+  n_flank     <- max(1L, round(n_bin * 0.1))
+  flank_l     <- 1:n_flank
+  flank_r     <- (n_bin - n_flank + 1):n_bin
+
   # TSS enrichment = signal at TSS / signal at flanking regions
-  tss_center <- rowMeans(tss_signal[, 45:55])
-  tss_flank <- rowMeans(cbind(rowMeans(tss_signal[, 1:10]), 
-                               rowMeans(tss_signal[, 90:100])))
-  
+  tss_center <- rowMeans(tss_signal[, center_ix])
+  tss_flank  <- rowMeans(cbind(rowMeans(tss_signal[, flank_l]),
+                               rowMeans(tss_signal[, flank_r])))
+
   enrichment <- mean(tss_center / tss_flank, na.rm=TRUE)
   tss_enrichment[[sample_name]] <- enrichment
 }

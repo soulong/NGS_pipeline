@@ -2,13 +2,13 @@
 
 # ============================= Basic Settings =============================
 # root directory of project
-root_dir: "/mnt/e/EED/2026-08-25_CutTag_cel"
+root_dir: "/mnt/d/EED_CutTag/X101SC26064008-Z01-J011"
 
 # Directory containing raw FASTQ files
 fastq_dir: 01.RawData
 
 # Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13), "fly" (Drosophila), "cel" (C. elegans)
-species: cel
+species: fly
 
 # Sample sheet CSV file (must contain columns: sample,group,control,target,fq1,fq2)
 samplesheet: samplesheet.csv
@@ -26,21 +26,33 @@ sort_mem_limit: 16G
 max_frag_length: 1000
 
 # Skip preprocessing steps, this is for running non-standard pipelines
-skip_preprocess: true
+skip_preprocess: false
 
 # Perform spike-in normalization alignment
+# (only needed for norm_method: Spike; with CPM it just wastes ~half the
+#  alignment time on the spike-in genome)
 run_spike: true
 
-# Normalization method: "CPM" (counts per million), "Spike" (spike-in), or "SpikeFree"
-norm_method: CPM
+# Normalization method(s): "CPM" (counts per million), "Spike" (spike-in),
+# or "SpikeFree" (spike-free). Comma-separated list runs each in turn
+# (like peak_caller), e.g.:
+#   norm_method: CPM, Spike
+# Each method produces its own BigWig (<sample>.<method>.bw), BigWig QC and
+# heatmaps, and one statistics.csv row per sample per method. A method whose
+# prerequisites are missing is skipped with a warning:
+#   Spike     -> needs spike-in alignment (run_spike: true)
+#   SpikeFree -> needs the spike-free scale factor file (spike_free_sf_file
+#                below, or result/03_bam/SpikeFree_SF.txt by default)
+norm_method: CPM, Spike
 
 # Peak calling tools: comma-separated subset of "macs, seacr" (any combination).
 # Empty/null -> skip peak calling. "macs" runs the "macs3" command.
-peak_caller: macs, seacr
+peak_caller: macs
 
 # MACS3 options only (e.g. --broad --nomodel). "-t/-c/-f BAMPE/-g/-n/--keep-dup all" are handled by script.
 # Note: "-g <genome size>" is set from the pipeline's own species table (helper.sh setup_genome).
-macs_parameter: -q 0.01 --broad --broad-cutoff 0.05
+# Note: in --broad mode MACS uses --broad-cutoff; a -q value is redundant/ignored.
+macs_parameter: --broad --broad-cutoff 0.05
 
 # SEACR_1.3.sh positional args: <numeric threshold> <norm|non> <relaxed|stringent>.
 # When a control sample exists in the samplesheet, the control bedgraph replaces the threshold.

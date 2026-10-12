@@ -14,9 +14,12 @@ source("F:/GitHub/myScript/NGS/peak_process.R")
 
 samples <- crossing(c("0_","05_"), c("1","2","3")) %>% 
   unite("uni", sep="") %>% pull() %>% print()
+# normalization method used for the bigwigs (config norm_method may produce
+# several: CPM/Spike/SpikeFree — bigwigs are named <sample>.<method>.bw)
+use_norm_method <- "CPM"
 bam_files <- str_c("03_bam/IMR", samples, ".filtered.bam") %>% 
   print()
-bw_files <- str_c("03_bam/IMR", samples, ".CPM.bw") %>% 
+bw_files <- str_c("03_bam/IMR", samples, ".", use_norm_method, ".bw") %>% 
   print()
 
 gr  <- import("04_peaks/consensus_H3K27me3.bed")
@@ -43,17 +46,23 @@ df <- list_rbind(result, names_to="group") %>%
   print()
 
 # merge replicates
-df_merge <- df %>% 
+df_merge <- df %>%
   reframe(across(starts_with("count_"), sum),
           across(starts_with("cov_"), mean),
-          .by=c(group, seqnames:width)) %>% 
-  pivot_wider(names_from=group, values_from=6:last_col()) %>% 
+          .by=c(group, seqnames:width)) %>%
+  # select value columns by name (positions silently misbind if a helper
+  # changes its column order)
+  pivot_wider(names_from=group, values_from=c(starts_with("count_"), starts_with("cov_"))) %>%
   print()
-df_merge <- df_merge %>% 
-  mutate(cov_ratio_0=(cov_region_0/(cov_left_0 + cov_right_0)),
-         cov_ratio_05=(cov_region_05/(cov_left_05 + cov_right_05))) %>% 
-  mutate(relative_diff=(cov_ratio_05) / cov_ratio_0) %>% 
-  arrange(desc(relative_diff)) %>% 
+df_merge <- df_merge %>%
+  # guard the ratios: a zero flank sum yields Inf/NaN artifacts that would
+  # otherwise dominate slice_max() "top changes" below
+  mutate(
+    cov_ratio_0  = ifelse((cov_left_0  + cov_right_0)  == 0, NA_real_, cov_region_0  / (cov_left_0  + cov_right_0)),
+    cov_ratio_05 = ifelse((cov_left_05 + cov_right_05) == 0, NA_real_, cov_region_05 / (cov_left_05 + cov_right_05))
+  ) %>%
+  mutate(relative_diff=(cov_ratio_05) / cov_ratio_0) %>%
+  arrange(desc(relative_diff)) %>%
   print()
 # export(df_merge %>% GRanges(), str_glue("{Sys.Date()}_df_merge.gtf"))
 
@@ -120,8 +129,7 @@ for (idx in seq_along(gr_use)) {
     colors=c("white","#295072"),
     kmeans=NA,
     sort_by='mean',
-    scale='none',
-    return_granges=T
+    scale='none'
   )
   # hp$heatmap
   pdf(str_glue("{Sys.Date()}_refpoint_scaleby_none_{names(gr_use)[idx]}.pdf"), width=7, height=9)
@@ -174,8 +182,7 @@ for(x in c(2000, 10000, 50000)) {
     colors=c("white","#295072"),
     kmeans=NA,
     sort_by='mean',
-    scale='none',
-    return_granges=T
+    scale='none'
   )
   # hp$heatmap
   pdf(str_glue("{Sys.Date()}_refpoint_scaleby_none_{x}.pdf"), width=7, height=9)

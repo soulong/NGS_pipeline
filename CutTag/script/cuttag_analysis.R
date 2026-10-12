@@ -9,16 +9,28 @@ library(circlize)
 library(DESeq2)
 require(org.Hs.eg.db)
 
-# load helper
-parent_path <- rstudioapi::getActiveDocumentContext()$path |> 
-  dirname()|> dirname()
-source(file.path(parent_path, 'ngs_helper.R'))
+# locate this script (RStudio active document, Rscript --file=, or cwd);
+# ngs_helper.R lives in the parent directory
+if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+  doc <- rstudioapi::getActiveDocumentContext()$path
+  script_dir <- if (!is.null(doc) && nzchar(doc)) dirname(doc) else getwd()
+} else {
+  ca <- commandArgs(trailingOnly = FALSE)
+  fa <- grep("^--file=", ca, value = TRUE)
+  script_dir <- if (length(fa) > 0) dirname(normalizePath(sub("^--file=", "", fa[1]))) else getwd()
+}
+source(file.path(dirname(script_dir), 'ngs_helper.R'))
 
 
-data_dir <- norm_path(r"(E:\NGS\2026-01-08_CutTag_293T_ZTX\result)") %>% 
-  setwd()
+data_dir <- norm_path(r"(E:\NGS\2026-01-08_CutTag_293T_ZTX\result)")
+setwd(data_dir)
 
 annodb <- "org.Hs.eg.db"
+# DESeq2 contrast (group column of the samples)
+contrast_pair <- c("P62", "DMSO")
+# which normalization's bigwigs to use (config norm_method may produce several:
+# CPM/Spike/SpikeFree — bigwigs are named <sample>.<method>.bw)
+use_norm_method <- "Spike"
 
 set_style <- function(x) { 
   seqlevelsStyle(x) <- "UCSC"
@@ -70,18 +82,22 @@ geneset_interest <- c(
 
 
 # bigwig ------------------------------------------------
-# run used in heatmap profiling
-bw_suffix <- '.CPM.bw'
-bw_file <- '03_bam' %>% 
-  list.files(pattern=bw_suffix, full.names=T) %>% # bw
-  set_names(., nm=map_chr(., \(x) basename(x) %>% 
-                            str_replace(fixed(bw_suffix),''))) %>% 
+# used in heatmap profiling — pick up bigwigs of ONE normalization (config
+# norm_method: CPM/Spike/SpikeFree; pick via use_norm_method above so a
+# multi-method run does not load the same sample twice)
+bw_pattern <- str_glue('\\.{use_norm_method}\\.bw$')
+bw_file <- '03_bam' %>%
+  list.files(pattern=bw_pattern, full.names=T) %>%
+  set_names(., nm=map_chr(., \(x) basename(x) %>%
+                            str_remove(bw_pattern))) %>%
   # subset samples
-  .[which(str_detect(names(.), 'TEAD|BRD4'))] %>% 
+  .[which(str_detect(names(.), 'TEAD|BRD4'))] %>%
   print()
 
-# reorder as heatmap needs
-new_order <- names(bw_file)[order(factor(sapply(strsplit(names(bw_file), "_"), `[`, 2)))]
+# reorder as heatmap needs — natural sort on the 2nd "_"-token so numeric
+# series sort 2 < 10 (plain alphabetical order would give "10" < "2")
+group_token <- sapply(strsplit(names(bw_file), "_"), `[`, 2)
+new_order <- order(match(group_token, str_sort(unique(group_token), numeric = TRUE)))
 bw_file <- bw_file[new_order]
 
 # read bw
@@ -129,9 +145,10 @@ anno <- consensus %>%
                            annoDb=annodb) %>% 
   {.@anno}
 
-# filter
-consensus <- anno %>% 
-  {.[.$geneId %in% geneset_interest]} %>%
+# filter — ChIPseeker's `geneId` is the Entrez/internal gene id; gene SYMBOLs
+# live in the `SYMBOL` column, and `geneset_interest` holds symbols
+consensus <- anno %>%
+  {.[.$SYMBOL %in% geneset_interest]} %>%
   {.[abs(.$distanceToTSS) <= 3000]} %>%
   print()
 
@@ -200,10 +217,12 @@ col_data <- colnames(count) %>%
 dds <- DESeqDataSetFromMatrix(
   count, col_data, design = ~ group) %>% 
   DESeq()
-dds_result <- results(dds, contrast=c("group", "P62", "DMSO")) %>% 
-  as_tibble(rownames='uid') %>% 
-  separate(uid, c("seqnames","start","end","width"), sep="_") %>% 
-  arrange(pvalue) %>% 
+dds_result <- results(dds, contrast=c("group", contrast_pair[1], contrast_pair[2])) %>%
+  as_tibble(rownames='uid') %>%
+  # uid was built from 3 fields (seqnames_start_end) — separating it into 4
+  # names produced an all-NA `width` column
+  separate(uid, c("seqnames","start","end"), sep="_") %>%
+  arrange(pvalue) %>%
   print()
 
 # anno deg
@@ -217,15 +236,17 @@ dds_result_gr_anno <- dds_result %>%
   # trim() %>% # fix out of genome range problem
   print()
 
-# tidy deg
-deg_tidy <- as_tibble(dds_result_gr_anno) %>% 
-  mutate(geneset_interest=ifelse(
-    geneId %in% geneset_interest, geneId, NA)) %>% 
+# tidy deg (SYMBOL, not the Entrez geneId, is matched against the geneset)
+# NOTE: CCN1/CCN2 in the geneset are aliases of CYR61/CTGF — they will never
+# match a ChIPseeker SYMBOL; kept for reference only.
+deg_tidy <- as_tibble(dds_result_gr_anno) %>%
+  mutate(geneset_hit=ifelse(
+    SYMBOL %in% geneset_interest, SYMBOL, NA)) %>%
   mutate(type=ifelse(
     log2FoldChange > log2(1.5) & padj < 0.05, 'pos',
-    ifelse(log2FoldChange < log2(1/1.5) & padj < 0.05, 'neg', NA))) %>% 
+    ifelse(log2FoldChange < log2(1/1.5) & padj < 0.05, 'neg', NA))) %>%
   mutate(label=ifelse(
-    !is.na(geneset_interest) & type %in% 'pos', geneset_interest, NA)) %>% 
+    !is.na(geneset_hit) & type %in% 'pos', geneset_hit, NA)) %>%
   glimpse()
 dplyr::count(deg_tidy, type)
 # save
@@ -278,12 +299,14 @@ for(idx in seq_along(rois)) {
     mode='reference_point', reference_point="center",
     bin_size=50, scale='none'
   )
-  # set rowname
-  consensus_rowname <- roi@elementMetadata %>% as_tibble() %>% 
-    mutate(uid=str_glue('{geneId}_{row_number()}'),.by=geneId) %>% 
+  # set rowname (SYMBOL + occurrence index so duplicate genes stay unique)
+  consensus_rowname <- roi@elementMetadata %>% as_tibble() %>%
+    mutate(uid=str_glue('{SYMBOL}_{row_number()}'),.by=SYMBOL) %>%
     pull(uid)
-  labels <- str_subset(
-    consensus_rowname, paste0(geneset_interest, collapse="_|"))
+  # label genes of interest — exact prefix match on the uid (SYMBOL_n);
+  # the old regex alternation (paste0(..., collapse="_|")) could never match
+  genes_in_rois <- str_replace(consensus_rowname, "_[0-9]+$", "")
+  labels <- consensus_rowname[genes_in_rois %in% geneset_interest]
   # plot
   result <- heatmap_profile(
     mat_list,
@@ -292,13 +315,14 @@ for(idx in seq_along(rois)) {
     rownames=consensus_rowname,
     labels=labels
   )
-  # save
+  # save (close only the device opened above, not every open device)
   # f_name <- str_glue('consensus_tead_and_deg_{names(rois)[idx]}')
   f_name <- str_glue('{names(rois)[idx]}')
-  pdf(str_glue("{Sys.Date()}_heatmap_{f_name}.pdf"), 
+  pdf(str_glue("{Sys.Date()}_heatmap_{f_name}.pdf"),
       width = length(result$heatmap)*1.6, height = 8)
+  dev_id <- dev.cur()
   print(result$heatmap)
-  while(dev.cur() != 1) dev.off()
+  dev.off(dev_id)
 }
 
 

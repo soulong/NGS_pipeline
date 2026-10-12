@@ -19,7 +19,9 @@ The sheet layout matches the old R output (columns: ensembl_id, symbol, type,
 then one column per sample in samplesheet order), so
 DESeq2.qmd and Enrichment.qmd read these files unchanged.
 
-Idempotent: skipped when today's <date>_gene_expression.xlsx already exists.
+Idempotent per product: each output xlsx is written only when missing, so a
+partial day (e.g. Salmon done, featureCounts added later) can be completed by
+re-running without redoing the earlier work.
 """
 
 import argparse
@@ -36,6 +38,21 @@ import pandas as pd
 from pytximport import tximport
 
 log = logging.getLogger("quantification")
+
+# pytximport counts_from_abundance mode for the GENE-level matrix:
+#   None                -> per-gene counts are simple sums of transcript counts.
+#                          DESeq2 then REQUIRES length-based offsets (e.g. via
+#                          DESeqDataSetFromTximport); plain summed counts in a
+#                          bare DESeqDataSetFromMatrix bias against genes with
+#                          preferentially long transcripts.
+#   "length_scaled_tpm" -> tximport-recommended mode when the count matrix is
+#                          fed to DESeq2 as-is (no offsets): counts are scaled
+#                          by average transcript length so a plain matrix is
+#                          method-correct.
+# The xlsx consumers here read the counts sheet as a plain matrix, so
+# length-scaled TPM is the method-correct default for the gene-level sheet.
+# The transcript-level sheet keeps raw summed counts.
+COUNTS_FROM_ABUNDANCE = "length_scaled_tpm"
 
 # Species -> (index subdir, gtf file name). Mirrors helper.sh setup_genome().
 SPECIES_GTF = {
@@ -167,11 +184,13 @@ def parse_gtf(gtf_file):
 
 # ============================= Samplesheet ================================
 def parse_samplesheet(path):
-    sample = pd.read_csv(path)
+    # dtype=str: pandas type inference turns a sample named "01" into 1,
+    # which then fails to match the salmon output directory
+    sample = pd.read_csv(path, dtype=str)
     if "sample" not in sample.columns:
         log.error("samplesheet '%s' missing 'sample' column", path)
         sys.exit(1)
-    samples = [str(x) for x in sample["sample"].tolist()]
+    samples = [str(x) for x in sample["sample"].dropna().tolist()]
     if len(set(samples)) != len(samples):
         log.error("duplicated sample names in samplesheet")
         sys.exit(1)
@@ -179,6 +198,25 @@ def parse_samplesheet(path):
 
 
 # ============================= Quantification =============================
+def check_sample_order(ad, samples):
+    """Fail loudly when pytximport's row order does not match the samplesheet.
+
+    The expression matrix is built by zipping pytximport rows with the
+    samplesheet order; if the two ever disagree (e.g. a pytximport version
+    starts sorting its output), samples would be silently mislabelled —
+    the most dangerous failure mode here.
+    """
+    obs = [str(x) for x in ad.obs_names]
+    base = [os.path.basename(o).removesuffix(".sf") for o in obs]
+    if set(base) == set(samples):
+        if base != samples:
+            raise ValueError(
+                f"pytximport sample order {base} does not match samplesheet order {samples}"
+            )
+    else:
+        # obs names are not resolvable to sample names (e.g. all "quant.sf"):
+        # fall back to the count-only check in matrix_from_anndata
+        log.debug("cannot map pytximport obs names to samples; skipping order check: %s", obs[:3])
 def matrix_from_anndata(ad, key, samples):
     """Extract a features x samples DataFrame from pytximport AnnData output."""
     if key == "counts":
@@ -235,10 +273,12 @@ def run_salmon_quantification(paths, samples, t2g, annotations, today):
         quant_files, data_type="salmon", transcript_gene_map=t2g,
         output_type="anndata", counts_from_abundance=None, return_transcript_data=True,
     )
+    check_sample_order(tx_txi, samples)
     gene_txi = tximport(
         quant_files, data_type="salmon", transcript_gene_map=t2g,
-        output_type="anndata", counts_from_abundance=None,
+        output_type="anndata", counts_from_abundance=COUNTS_FROM_ABUNDANCE,
     )
+    check_sample_order(gene_txi, samples)
 
     gene_annotation, transcript_annotation = annotations
 
@@ -285,6 +325,12 @@ def run_featurecounts_quantification(paths, samples, gene_annotation, today):
     fc["ensembl_id"] = fc["ensembl_id"].astype(str).map(strip_version)
 
     sample_cols = [s for s in samples if s in fc.columns]
+    missing = [s for s in samples if s not in fc.columns]
+    if missing:
+        log.warning(
+            "featureCounts output is missing sample(s) %s; they will be "
+            "absent from the bam xlsx", missing,
+        )
     length = fc["Length"].astype(float)
 
     # counts + annotation (R right_join semantics)
@@ -334,8 +380,19 @@ def main():
     samples = parse_samplesheet(paths["samplesheet"])
 
     gene_out = os.path.join(paths["quantification_dir"], f"{today}_gene_expression.xlsx")
-    if os.path.isfile(gene_out):
-        log.info("Quantification output already exists, skipping: %s", gene_out)
+    bam_out = os.path.join(paths["quantification_dir"], f"{today}_gene_expression_bam.xlsx")
+
+    # Idempotency is PER PRODUCT: an early return keyed on the salmon output
+    # alone used to make the featureCounts xlsx unreachable when Salmon had
+    # already run the same day.
+    skip_salmon = os.path.isfile(gene_out)
+    skip_bam = os.path.isfile(bam_out)
+    if skip_salmon:
+        log.info("Gene-level Salmon output already exists, skipping salmon import: %s", gene_out)
+    if skip_bam:
+        log.info("featureCounts output already exists, skipping: %s", bam_out)
+    if skip_salmon and skip_bam:
+        log.info("All quantification outputs already exist for %s", today)
         return
 
     log.info("Parsing annotation: %s", paths["gtf_file"])
@@ -345,18 +402,20 @@ def main():
     t2g, gene_annotation, transcript_annotation = parse_gtf(paths["gtf_file"])
     log.info("  genes: %d, transcripts: %d", len(gene_annotation), len(transcript_annotation))
 
-    ran_salmon = False
-    if os.path.isdir(paths["salmon_dir"]):
-        ran_salmon = run_salmon_quantification(
-            paths, samples, t2g, (gene_annotation, transcript_annotation), today)
-    else:
-        log.info("no salmon output directory found, skip it: %s", paths["salmon_dir"])
+    ran_salmon = skip_salmon  # existing output counts as "done"
+    if not skip_salmon:
+        if os.path.isdir(paths["salmon_dir"]):
+            ran_salmon = run_salmon_quantification(
+                paths, samples, t2g, (gene_annotation, transcript_annotation), today)
+        else:
+            log.info("no salmon output directory found, skip it: %s", paths["salmon_dir"])
 
-    ran_bam = False
-    if os.path.isdir(paths["bam_count_dir"]):
-        ran_bam = run_featurecounts_quantification(paths, samples, gene_annotation, today)
-    else:
-        log.info("no featurecounts directory found, skip it: %s", paths["bam_count_dir"])
+    ran_bam = skip_bam
+    if not skip_bam:
+        if os.path.isdir(paths["bam_count_dir"]):
+            ran_bam = run_featurecounts_quantification(paths, samples, gene_annotation, today)
+        else:
+            log.info("no featurecounts directory found, skip it: %s", paths["bam_count_dir"])
 
     if not (ran_salmon or ran_bam):
         log.error("nothing to quantify (no salmon or featureCounts output)")

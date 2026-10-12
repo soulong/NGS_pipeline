@@ -40,9 +40,10 @@ parse_yaml_config() {
         [[ "$key" =~ ^[[:space:]]*# ]] && continue
         [[ -z "$key" ]] && continue
         
-        # Remove leading/trailing whitespace and quotes
+        # Remove leading/trailing whitespace and quotes; strip inline comments
+        # ("threads: 12  # note" would otherwise keep "# note" as the value)
         key=$(echo "$key" | xargs)
-        value=$(echo "$value" | xargs | sed 's/^["'\'']\|["'\'']$//g')
+        value=$(echo "$value" | sed 's/[[:space:]]#.*$//' | xargs | sed 's/^["'\'']\|["'\'']$//g')
         
         # Skip empty values
         [[ -z "$value" ]] && continue
@@ -98,27 +99,42 @@ bowtie2_alignment() {
     local markdup_bam="$ALIGN_DIR/${sample}.markdup.bam"
     local flagstat_file="$ALIGN_DIR/${sample}.markdup.flagstat"
     
+    if [[ -s "$markdup_bam" && -s "${markdup_bam}.bai" && ! -s "$flagstat_file" ]]; then
+        log_info "[$sample] Regenerating missing flagstat"
+        sambamba flagstat -t "$THREADS" "$markdup_bam" > "$flagstat_file" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
+    fi
+
     if [[ ! -s "$markdup_bam" || ! -s "${markdup_bam}.bai" ]]; then
         log_info "[$sample] Aligning to genome"
+        # (stderr of each tool goes to a per-sample log instead of /dev/null so
+        # failures leave a trace; command substitution at the call site would
+        # otherwise swallow the non-zero exit of this function)
         bowtie2 -x "$BOWTIE2_INDEX" -1 "$clean1" -2 "$clean2" -p "$THREADS" --phred33 \
             --very-sensitive --local --no-mixed --no-discordant -I 10 -X "$MAX_FRAG_LENGTH" \
             --rg-id "$sample" --rg "SM:${sample}\tPL:ILLUMINA" \
             2>"$ALIGN_DIR/${sample}.bowtie2.log" \
-            | sambamba view -t "$THREADS" -S -f bam /dev/stdin 2>/dev/null \
-            | sambamba sort -t "$THREADS" -m "$SORT_MEM_LIMIT" -o "$sorted_bam" /dev/stdin 2>/dev/null
-        
+            | sambamba view -t "$THREADS" -S -f bam /dev/stdin 2>>"$ALIGN_DIR/${sample}.sambamba.log" \
+            | sambamba sort -t "$THREADS" -m "$SORT_MEM_LIMIT" -o "$sorted_bam" /dev/stdin 2>>"$ALIGN_DIR/${sample}.sambamba.log"
+
         log_info "[$sample] Marking duplicates"
-        sambamba markdup -t "$THREADS" "$sorted_bam" "$markdup_bam" 2>/dev/null
-        sambamba index -t "$THREADS" "$markdup_bam" 2>/dev/null
-        sambamba flagstat "$markdup_bam" > "$flagstat_file" 2>/dev/null
-        [[ "$(wc -c < ${flagstat_file})" -gt 5 ]] && rm "$sorted_bam" "${sorted_bam}.bai"
+        sambamba markdup -t "$THREADS" "$sorted_bam" "$markdup_bam" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
+        sambamba index -t "$THREADS" "$markdup_bam" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
+        sambamba flagstat "$markdup_bam" > "$flagstat_file" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
+        if [[ -s "$flagstat_file" ]]; then
+            rm -f "$sorted_bam" "${sorted_bam}.bai"
+        fi
     fi
-    
-    # Extract statistics
-    local total_reads=$(extract_flagstat_value "$flagstat_file" "in total" 1)
-    local mapped_reads=$(extract_flagstat_value "$flagstat_file" "mapped (.*N/A)" 1)
-    local duplicate_reads=$(extract_flagstat_value "$flagstat_file" "duplicates" 1)
-    
+
+    # Extract statistics (hard-fail: a missing/unreadable flagstat must not
+    # silently produce empty stats and an unnormalized scale factor downstream)
+    local total_reads mapped_reads duplicate_reads
+    total_reads=$(extract_flagstat_value "$flagstat_file" "in total" 1) \
+        || die "[$sample] cannot read total reads from $flagstat_file"
+    mapped_reads=$(extract_flagstat_value "$flagstat_file" "mapped (.*N/A)" 1) \
+        || die "[$sample] cannot read mapped reads from $flagstat_file"
+    duplicate_reads=$(extract_flagstat_value "$flagstat_file" "duplicates" 1) \
+        || die "[$sample] cannot read duplicate reads from $flagstat_file"
+
     echo "$total_reads $mapped_reads $duplicate_reads"
 }
 
@@ -136,15 +152,19 @@ bowtie2_alignment_spike() {
             --very-sensitive --local --no-mixed --no-discordant -I 10 -X "$MAX_FRAG_LENGTH" \
             --rg-id "$sample" --rg "SM:${sample}\tPL:ILLUMINA" \
             2>"$ALIGN_DIR/${sample}.spike.bowtie2.log" \
-            | sambamba view -t "$THREADS" -S -f bam /dev/stdin 2>/dev/null \
+            | sambamba view -t "$THREADS" -S -f bam /dev/stdin 2>>"$ALIGN_DIR/${sample}.sambamba.log" \
             | sambamba sort -t "$THREADS" -m "$SORT_MEM_LIMIT" \
-                -o "$spike_sorted_bam" /dev/stdin 2>/dev/null
-        
-        sambamba flagstat "$spike_sorted_bam" > "$spike_flagstat" 2>/dev/null
-        [[ "$(wc -c < ${spike_flagstat})" -gt 5 ]] && rm "$spike_sorted_bam" "${spike_sorted_bam}.bai"
+                -o "$spike_sorted_bam" /dev/stdin 2>>"$ALIGN_DIR/${sample}.sambamba.log"
+
+        sambamba flagstat "$spike_sorted_bam" > "$spike_flagstat" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
+        if [[ -s "$spike_flagstat" ]]; then
+            rm -f "$spike_sorted_bam" "${spike_sorted_bam}.bai"
+        fi
     fi
-    
-    local spike_reads=$(extract_flagstat_value "$spike_flagstat" "mapped (.*N/A)" 1)
+
+    local spike_reads
+    spike_reads=$(extract_flagstat_value "$spike_flagstat" "mapped (.*N/A)" 1) \
+        || die "[$sample] cannot read spike-in mapped reads from $spike_flagstat"
     echo "$spike_reads"
 }
 
@@ -153,8 +173,10 @@ bam_filter() {
     local markdup_bam="$ALIGN_DIR/${sample}.markdup.bam"
     local filtered_bam="$ALIGN_DIR/${sample}.filtered.bam"
     local flagstat_filtered="$ALIGN_DIR/${sample}.filtered.flagstat"
-    
-    if [[ ! -s "$flagstat_filtered" ]]; then
+
+    # Rerun when either the BAM or its flagstat is missing (both are needed:
+    # the flagstat alone cannot regenerate a filtered BAM that was cleaned up)
+    if [[ ! -s "$filtered_bam" || ! -s "$flagstat_filtered" ]]; then
         local chr_filter
         case "$SPECIES" in
             chm13|hs|mm)
@@ -167,15 +189,21 @@ bam_filter() {
                 chr_filter='rname =~ "^(2[LR]|3[LR]|4|X|Y)$"'
                 ;;
         esac
+        if [[ -z "${chr_filter:-}" ]]; then
+            log_error "[$sample] Unsupported species '$SPECIES' in bam_filter (supported: chm13, hs, mm, cel, fly)"
+            exit 1
+        fi
         log_info "[$sample] Filtering BAM (MAPQ≥30, proper pairs, main chromosomes)"
-        samtools view -@ "$THREADS" -b -f 2 -q 30 -F 1804 \
+        samtools view -@ "$THREADS" -b -f 2 -q 30 -F 3852 \
             -e "$chr_filter" \
             -o "$filtered_bam" "$markdup_bam"
-        sambamba index -t "$THREADS" "$filtered_bam" 2>/dev/null
-        sambamba flagstat -t "$THREADS" "$filtered_bam" > "$flagstat_filtered" 2>/dev/null
+        sambamba index -t "$THREADS" "$filtered_bam" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
+        sambamba flagstat -t "$THREADS" "$filtered_bam" > "$flagstat_filtered" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
     fi
-    
-    local filtered_reads=$(extract_flagstat_value "$flagstat_filtered" "mapped (.*N/A)" 1)
+
+    local filtered_reads
+    filtered_reads=$(extract_flagstat_value "$flagstat_filtered" "mapped (.*N/A)" 1) \
+        || die "[$sample] cannot read filtered reads from $flagstat_filtered"
     echo "$filtered_reads"
 }
 
@@ -183,40 +211,54 @@ generate_bigwig() {
     local sample="$1" scale_factor="$2"
     local filtered_bam="$ALIGN_DIR/${sample}.filtered.bam"
     local bigwig="$ALIGN_DIR/${sample}.${NORM_METHOD}.bw"
-    
-    if [[ ! -s "$bigwig" ]]; then
+
+    if ! is_done "$bigwig"; then
         log_info "[$sample] Generating BigWig (scale: $scale_factor)"
         bamCoverage -b "$filtered_bam" -o "$bigwig" \
-            -p "$THREADS" --binSize 10 --scaleFactor "$scale_factor" 2>/dev/null
+            -p "$THREADS" --binSize 10 --scaleFactor "$scale_factor" \
+            2>>"$ALIGN_DIR/bamCoverage.log" || die "[$sample] bamCoverage failed (see $ALIGN_DIR/bamCoverage.log)"
+        mark_done "$bigwig"
     fi
 }
 
 
 run_alignment() {
     local sample="$1" group="$2" control="$3" target="$4" fq1="$5" fq2="$6"
-    
-    # Skip if already processed
-    if grep -q "^${sample}," "$STATS_CSV"; then
-        log_info "[$sample] Alignment completed"
-        return 0
+
+    # Skip if already processed (exact sample-name match — a regex/grep would
+    # let "KD.1" match a "KDX1,..." row). Also require the key products to
+    # still exist: a CSV row alone says nothing about later manual cleanup.
+    if awk -F',' -v s="$sample" '$1 == s { found=1; exit } END { exit !found }' "$STATS_CSV"; then
+        if [[ -s "$ALIGN_DIR/${sample}.filtered.bam" ]] && is_done "$ALIGN_DIR/${sample}.${NORM_METHOD}.bw"; then
+            log_info "[$sample] Alignment completed"
+            return 0
+        fi
+        log_warn "[$sample] Statistics row exists but BAM/BigWig missing — re-running alignment steps"
     fi
-    
-    # Alignment and marking duplicates
-    read total_reads mapped_reads duplicate_reads <<< $(bowtie2_alignment "$sample")
+
+    # Alignment and marking duplicates. NOTE: use `stats=$(...)` directly —
+    # `read x <<< $(...)` would swallow the non-zero exit of the substitution.
+    local stats
+    stats=$(bowtie2_alignment "$sample") || die "[$sample] genome alignment failed (see $ALIGN_DIR/${sample}.bowtie2.log)"
+    local total_reads mapped_reads duplicate_reads
+    read -r total_reads mapped_reads duplicate_reads <<< "$stats"
     local mapped_pct dup_pct
     mapped_pct=$(awk -v m="$mapped_reads" -v t="$total_reads" 'BEGIN{if(t==0){printf "0.00"} else {printf "%.2f", (m/t)*100}}')
     dup_pct=$(awk -v d="$duplicate_reads" -v t="$total_reads" 'BEGIN{if(t==0){printf "0.00"} else {printf "%.2f", (d/t)*100}}')
     log_info "[$sample] Stats - Total: $total_reads, Mapped: $mapped_reads (${mapped_pct}%), Duplicates: $duplicate_reads (${dup_pct}%)"
-    
+
     # Filtering
-    local filtered_reads=$(bam_filter "$sample")
-    filtered_pct=$(awk -v d="$filtered_reads" -v t="$total_reads" 'BEGIN{if(t==0){printf "0.00"} else {printf "%.f", (d/t)*100}}')
+    local filtered_reads
+    filtered_reads=$(bam_filter "$sample") || die "[$sample] BAM filtering failed"
+    local filtered_pct
+    filtered_pct=$(awk -v d="$filtered_reads" -v t="$total_reads" 'BEGIN{if(t==0){printf "0.00"} else {printf "%.2f", (d/t)*100}}')
     log_info "[$sample] Filtered reads: $filtered_reads (${filtered_pct}%)"
 
     # Spike-in alignment (optional)
     local spike_reads=0
     if [[ "$RUN_SPIKE" == true ]]; then
-        spike_reads=$(bowtie2_alignment_spike "$sample")
+        spike_reads=$(bowtie2_alignment_spike "$sample") || die "[$sample] spike-in alignment failed"
+        local spike_pct
         spike_pct=$(awk -v d="$spike_reads" -v t="$total_reads" 'BEGIN{if(t==0){printf "0.000"} else {printf "%.3f", (d/t)*100}}')
         log_info "[$sample] Spike-in reads: $spike_reads (${spike_pct}%)"
     fi
@@ -252,13 +294,26 @@ run_macs() {
     
     if [[ ! -s "$peak_file" ]]; then
         log_info "[$sample] Running macs"
-        
+
         # Build MACS3 arguments
         local -a macs_args=("-t" "$filtered_bam" "-f" "BAMPE" "-g" "$GSIZE" "-n" "$PEAK_DIR/${sample}" "--keep-dup" "all")
-        # Split MACS parameters string into array and append
+        # Append config MACS parameters, dropping model-related flags that
+        # BAMPE ignores (MACS builds fragment sizes from the paired ends, so
+        # --nomodel/--shift/--extsize are no-ops and only mislead the config).
+        local -a macs_params_arr=() filtered_params=()
         read -ra macs_params_arr <<< "$MACS_PARAMETER"
-        macs_args+=("${macs_params_arr[@]}")
-        
+        local p skip_next=false
+        for p in "${macs_params_arr[@]}"; do
+            if [[ "$skip_next" == true ]]; then skip_next=false; continue; fi
+            case "$p" in
+                --nomodel)                      ;;
+                --shift|--extsize) skip_next=true ;;
+                --shift=*|--extsize=*)          ;;
+                *)               filtered_params+=("$p") ;;
+            esac
+        done
+        macs_args+=("${filtered_params[@]}")
+
         if [[ -n "$control" ]]; then
             local control_bam="$ALIGN_DIR/${control}.filtered.bam"
             if [[ -f "$control_bam" ]]; then
@@ -267,12 +322,15 @@ run_macs() {
                 log_warn "[$sample] Control BAM not found: $control_bam"
             fi
         fi
-        
-        macs3 callpeak "${macs_args[@]}" 2>/dev/null
+
+        macs3 callpeak "${macs_args[@]}" 2>>"$PEAK_DIR/${sample}.macs3.log" || {
+            log_error "[$sample] macs3 callpeak failed (see $PEAK_DIR/${sample}.macs3.log)"
+            PIPELINE_FAILURES+=("macs3:$sample")
+        }
     else
         log_info "[$sample] Call peak completed"
     fi
-} 
+}
 
 # ============================= Peak Consensus =============================
 run_consensus() {
@@ -298,6 +356,18 @@ run_consensus() {
         fi
     done < <(tail -n +2 "$SAMPLESHEET" | tr -d '\r')
 
+    if [[ ${#all_peak_files[@]} -eq 0 ]]; then
+        log_warn "No peak files found for any sample (no peaks called?)"
+        return 0
+    fi
+
+    if [[ ${#target_peaks[@]} -eq 0 ]]; then
+        log_warn "${#all_peak_files[@]} peak file(s) found, but no sample has a 'target' in $SAMPLESHEET"
+        log_warn "        → consensus peaks / FRiP / per-target heatmaps are skipped"
+        log_warn "        → fill the 'target' column and re-run to enable them"
+        return 0
+    fi
+
     # Create consensus for each target
     for target in "${!target_peaks[@]}"; do
         local -a peaks=()
@@ -310,13 +380,13 @@ run_consensus() {
 
         local consensus_bed="${PEAK_DIR}/consensus_${target}.bed"
         if [[ ! -s "$consensus_bed" ]]; then
-            log_info "[$target] Make consensus from ${#peaks[@]} samples"
+            log_info "[$target] Make UNION consensus (region present in ANY sample) from ${#peaks[@]} samples"
             merge_peakfiles --input-peaks "${peaks[*]}" --output-bed "$consensus_bed" --chrom-size "$CHROM_SIZES" || \
-                { 
+                {
                     log_warn "Failed to create consensus for: $target"
                     continue
                 }
-        else 
+        else
             log_info "[$target] Consensus peak completed"
         fi
     done
@@ -352,7 +422,8 @@ calculate_frip() {
         log_info "[QC] Computing FRiP: $prefix"
         plotEnrichment -p "$THREADS" -b "${bam_array[@]}" \
             --BED "$consensus_bed" --labels "${name_array[@]}" --outRawCounts "$frip_tab" --extendReads \
-            --plotFile "$frip_plot" --plotTitle "FRiP - $prefix (Consensus Peaks)" >/dev/null
+            --plotFile "$frip_plot" --plotTitle "FRiP - $prefix (Consensus Peaks)" >/dev/null \
+            || { log_error "[QC] plotEnrichment (FRiP) failed for: $prefix"; PIPELINE_FAILURES+=("frip:$prefix"); }
     fi
 }
 
@@ -392,11 +463,16 @@ profile_heatmap() {
         local heatmap_tss="$MULTIQC_DIR/${bed_name}_${prefix}_tss_${NORM_METHOD}_heatmap.pdf"
         if [[ ! -s "$heatmap_tss" ]]; then
             local mat_tss="$MULTIQC_DIR/${bed_name}_${prefix}_tss_${NORM_METHOD}_mat.gz"
-            [[ ! -s "$mat_tss" ]] && \
+            if [[ ! -s "$mat_tss" ]]; then
                 computeMatrix reference-point --referencePoint TSS -S "${bw_array[@]}" -R "$heatmap_bed" \
                     -o "$mat_tss" -p "$THREADS" -b 3000 -a 3000 --binSize "$HEATMAP_BINSIZE" --skipZeros \
-                    --samplesLabel "${name_array[@]}" --quiet >/dev/null
-            plotHeatmap -m "$mat_tss" -out "$heatmap_tss" --colorMap Blues >/dev/null
+                    --samplesLabel "${name_array[@]}" --quiet >/dev/null \
+                    || { log_error "[Heatmap QC] computeMatrix (TSS) failed: $bed_name/$prefix"; PIPELINE_FAILURES+=("computeMatrix:$prefix"); }
+            fi
+            if [[ -s "$mat_tss" ]]; then
+                plotHeatmap -m "$mat_tss" -out "$heatmap_tss" --colorMap Blues >/dev/null \
+                    || { log_error "[Heatmap QC] plotHeatmap (TSS) failed: $bed_name/$prefix"; PIPELINE_FAILURES+=("plotHeatmap:$prefix"); }
+            fi
         fi
     fi
 
@@ -405,11 +481,16 @@ profile_heatmap() {
         local heatmap_center="$MULTIQC_DIR/${bed_name}_${prefix}_center_${NORM_METHOD}_heatmap.pdf"
         if [[ ! -s "$heatmap_center" ]]; then
             local mat_center="$MULTIQC_DIR/${bed_name}_${prefix}_center_${NORM_METHOD}_mat.gz"
-            [[ ! -s "$mat_center" ]] && \
+            if [[ ! -s "$mat_center" ]]; then
                 computeMatrix reference-point --referencePoint center -S "${bw_array[@]}" -R "$heatmap_bed" \
                     -o "$mat_center" -p "$THREADS" -b 3000 -a 3000 --binSize "$HEATMAP_BINSIZE" --skipZeros \
-                    --samplesLabel "${name_array[@]}" --quiet >/dev/null
-            plotHeatmap -m "$mat_center" -out "$heatmap_center" --colorMap Blues >/dev/null
+                    --samplesLabel "${name_array[@]}" --quiet >/dev/null \
+                    || { log_error "[Heatmap QC] computeMatrix (center) failed: $bed_name/$prefix"; PIPELINE_FAILURES+=("computeMatrix:$prefix"); }
+            fi
+            if [[ -s "$mat_center" ]]; then
+                plotHeatmap -m "$mat_center" -out "$heatmap_center" --colorMap Blues >/dev/null \
+                    || { log_error "[Heatmap QC] plotHeatmap (center) failed: $bed_name/$prefix"; PIPELINE_FAILURES+=("plotHeatmap:$prefix"); }
+            fi
         fi
     fi
     
@@ -443,14 +524,16 @@ bam_qc() {
         log_info "[BAM QC] Calculating fragment length"
         bamPEFragmentSize -b "${bam_array[@]}" -p "$THREADS" --maxFragmentLength "$MAX_FRAG_LENGTH" \
             --histogram "$MULTIQC_DIR/BAM_fragment_length.pdf" --samplesLabel "${name_array[@]}" \
-            --outRawFragmentLengths "$MULTIQC_DIR/BAM_fragment_length.txt" >/dev/null
+            --outRawFragmentLengths "$MULTIQC_DIR/BAM_fragment_length.txt" >/dev/null \
+            || { log_error "[BAM QC] bamPEFragmentSize failed"; PIPELINE_FAILURES+=("bamPEFragmentSize"); }
     fi
-    
+
     # Fingerprint
     if [[ ! -s "$MULTIQC_DIR/BAM_fingerprint.pdf" ]]; then
         log_info "[BAM QC] Generating fingerprint"
         plotFingerprint -b "${bam_array[@]}" -p "$THREADS" --labels "${name_array[@]}" --skipZeros \
-            --plotFile "$MULTIQC_DIR/BAM_fingerprint.pdf" --outRawCounts "$MULTIQC_DIR/BAM_fingerprint.txt" >/dev/null 2>&1
+            --plotFile "$MULTIQC_DIR/BAM_fingerprint.pdf" --outRawCounts "$MULTIQC_DIR/BAM_fingerprint.txt" >/dev/null 2>&1 \
+            || { log_error "[BAM QC] plotFingerprint failed"; PIPELINE_FAILURES+=("plotFingerprint"); }
     fi
 }
 
@@ -474,27 +557,30 @@ bigwig_qc() {
     if [[ ! -s "$npz_file" ]]; then
         log_info "[BigWig QC] Computing BigWig"
         multiBigwigSummary bins -b "${bw_array[@]}" -p "$THREADS" \
-            --labels "${name_array[@]}" -o "$npz_file" 2>/dev/null
+            --labels "${name_array[@]}" -o "$npz_file" 2>>"$MULTIQC_DIR/multiBigwigSummary.log" \
+            || { log_error "[BigWig QC] multiBigwigSummary failed for: $prefix (see $MULTIQC_DIR/multiBigwigSummary.log)"; PIPELINE_FAILURES+=("multiBigwigSummary:$prefix"); return 0; }
     fi
-    
+
     # PCA plot
     if [[ ! -s "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_PCA.pdf" ]]; then
         log_info "[BigWig QC] Generating PCA"
-        python "$SCRIPT_DIR/../scripts/plot_pca.py" -in "$npz_file" \
+        python3 "$SCRIPT_DIR/../scripts/plot_pca.py" -in "$npz_file" \
             -o "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_PCA.pdf" \
             --outFileNameData "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_PCA.tab" \
             --ntop "$PCA_NTOP" --plotTitle "$prefix" \
             --samplesheet "$SAMPLESHEET" >/dev/null 2>&1 || {
                 log_warn "plot_pca.py failed, falling back to plotPCA"
-                plotPCA -in "$npz_file" -o "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_PCA.pdf" >/dev/null
+                plotPCA -in "$npz_file" -o "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_PCA.pdf" >/dev/null \
+                    || { log_error "[BigWig QC] plotPCA failed for: $prefix"; PIPELINE_FAILURES+=("plotPCA:$prefix"); }
             }
     fi
-    
+
     # Correlation heatmap
     if [[ ! -s "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_correlation.pdf" ]]; then
         log_info "[BigWig QC] Generating Correlation"
         plotCorrelation -in "$npz_file" --corMethod spearman --whatToPlot heatmap \
-            -o "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_correlation.pdf" >/dev/null
+            -o "$MULTIQC_DIR/BigWig_${prefix}_${NORM_METHOD}_correlation.pdf" >/dev/null \
+            || { log_error "[BigWig QC] plotCorrelation failed for: $prefix"; PIPELINE_FAILURES+=("plotCorrelation:$prefix"); }
     fi
 }
 
@@ -511,9 +597,13 @@ run_global_qc() {
         
         local bam="$ALIGN_DIR/${sample}.filtered.bam"
         local bw="$ALIGN_DIR/${sample}.${NORM_METHOD}.bw"
-        
+
         [[ ! -f "$bam" ]] && continue
-        
+        if [[ ! -s "$bw" ]]; then
+            log_warn "[$sample] BigWig missing (expected: $bw) — sample excluded from QC"
+            continue
+        fi
+
         ALL_SAMPLES+=("$sample")
         ALL_BAMS+=("$bam")
         ALL_BWS+=("$bw")
@@ -608,18 +698,34 @@ main() {
     HEATMAP_MAX_REGIONS="${HEATMAP_MAX_REGIONS:-100000}"
     PCA_NTOP="${PCA_NTOP:-100000}"
     log_info "  Heatmap bin size: $HEATMAP_BINSIZE (max regions: $HEATMAP_MAX_REGIONS, PCA ntop: $PCA_NTOP)"
-    
-    # Check dependencies
-    require_commands fastqc fastp bowtie2 sambamba samtools macs3 deeptools bedtools multiqc
 
-    # set path
+    # Check dependencies.
+    # - fastqc: the FastQC step is currently disabled in helper.sh (run_preprocess)
+    # - deepTools ships per-tool executables; there is no "deeptools" binary,
+    #   so check every deepTools command this pipeline actually calls.
+    # - macs3 is required whenever Phase 3 runs (checked unconditionally here
+    #   to fail before any compute-heavy work).
+    require_commands fastp bowtie2 sambamba samtools macs3 bedtools multiqc \
+        bamCoverage computeMatrix plotHeatmap multiBigwigSummary plotCorrelation \
+        plotPCA bamPEFragmentSize plotFingerprint plotEnrichment
+
+    # set path — validate root BEFORE any log file inside it is opened
+    if [[ ! -d "$ROOT_DIR" ]]; then
+        echo "ERROR: root_dir does not exist: $ROOT_DIR" >&2
+        exit 1
+    fi
     OUTDIR="$ROOT_DIR/$OUTDIR"
     FASTQ_DIR="$ROOT_DIR/$FASTQ_DIR"
     SAMPLESHEET="$ROOT_DIR/$SAMPLESHEET"
+    mkdir -p "$OUTDIR"
 
     # Setup logging
     local log_file="$ROOT_DIR/pipeline.log"
     exec > >(tee -a "$log_file") 2>&1
+
+    # Non-fatal per-sample/per-step failures (peak calling, QC) are collected
+    # here and reported with a non-zero exit at the end.
+    PIPELINE_FAILURES=()
     
     log_info "============================================================"
     log_info "ATACseq Analysis Pipeline"
@@ -706,7 +812,19 @@ EOF
     log_info "========== Phase 4: QC =========="
     create_dirs "$MULTIQC_DIR"
     run_global_qc
-    
+
+    # Final failure summary: individual steps were allowed to continue, but the
+    # overall exit status must reflect that something went wrong.
+    if [[ ${#PIPELINE_FAILURES[@]} -gt 0 ]]; then
+        log_error "Pipeline finished WITH FAILURES (${#PIPELINE_FAILURES[@]}):"
+        local f
+        for f in "${PIPELINE_FAILURES[@]}"; do
+            log_error "  - $f"
+        done
+        log_error "See $ROOT_DIR/pipeline.log for details."
+        exit 1
+    fi
+
     log_info ""
     log_info "============================================================"
     log_info "Pipeline completed successfully!"

@@ -77,7 +77,9 @@ run_salmon() {
         log_info "[$sample] Salmon quantification completed"
     else
         log_info "[$sample] Running Salmon quantification"
-        setup_trap "$salmon_out*"
+        # exact directory only: a bare "$salmon_out*" would also delete
+        # sibling samples sharing the prefix (sample1* matches sample10*)
+        setup_trap "$salmon_out"
         salmon quant -i "$SALMON_INDEX" -l A -p "$THREADS" \
             -1 "$clean_r1" -2 "$clean_r2" \
             --seqBias --gcBias --validateMappings -o "$salmon_out" \
@@ -101,37 +103,50 @@ run_star() {
     local final_bam="$STAR_DIR/${sample}.bam"
 
     if check_files_exists "$final_bam"; then
-        log_info "[$sample] STAR alignment compeleted"
+        log_info "[$sample] STAR alignment completed"
     else
         log_info "[$sample] Running STAR alignment"
 
         setup_trap "${star_prefix}*"
-        [[ -d ~/tmp ]] && rm -r ~/tmp
+        # Per-sample temp dir. The old global "~/tmp" was rm -rf'ed on every
+        # run: it can hold unrelated data and breaks concurrent pipeline runs.
+        local star_tmp="$STAR_DIR/${sample}.tmp"
+        [[ -d "$star_tmp" ]] && rm -rf "$star_tmp"
         STAR --runThreadN "$THREADS" --genomeDir "$STAR_INDEX" \
             --readFilesCommand zcat --readFilesIn "$clean_r1" "$clean_r2" \
             --outFileNamePrefix "$star_prefix" --outSAMtype BAM SortedByCoordinate \
-            --outTmpDir ~/tmp 1>/dev/null 2>>"$STAR_DIR/star.log" || {
-            log_error "[$sample] STAR failed"
+            --outTmpDir "$star_tmp" 1>/dev/null 2>>"$STAR_DIR/star.log" || {
+            log_error "[$sample] STAR failed (see $STAR_DIR/star.log)"
             clear_trap
+            rm -rf "$star_tmp"
             return 1
         }
-        
-        # Rename BAM file
-        [[ ! -s "$final_bam" ]] && mv "$star_bam" "$final_bam"
+        rm -rf "$star_tmp"
+
+        # Rename BAM file — fail loudly if STAR succeeded but produced no
+        # sorted BAM (the old silent fall-through died later on bamCoverage
+        # with its error message discarded)
+        if [[ -s "$star_bam" ]]; then
+            mv -f "$star_bam" "$final_bam"
+        else
+            log_error "[$sample] STAR produced no sorted BAM (see $STAR_DIR/star.log)"
+            clear_trap
+            return 1
+        fi
         clear_trap
 
         # Index BAM file
-        if [[ -f "$final_bam" ]]; then
-            log_info "[$sample] Indexing BAM file"
-            samtools index -@ "$THREADS" "$final_bam" || log_warn "[$sample] BAM indexing failed"
-        fi
+        log_info "[$sample] Indexing BAM file"
+        samtools index -@ "$THREADS" "$final_bam" || log_warn "[$sample] BAM indexing failed"
     fi
-        
+
     # bam to bw
     if [[ ! -s "${star_prefix}CPM.bw" ]]; then
         log_info "[$sample] Converting BAM to bigWig"
         bamCoverage -b "$final_bam" -o "${star_prefix}CPM.bw" -of bigwig \
-            --binSize 10 -p "$THREADS" --normalizeUsing CPM 2>/dev/null
+            --binSize 10 -p "$THREADS" --normalizeUsing CPM \
+            2>>"$STAR_DIR/bamCoverage.log" \
+            || { log_error "[$sample] bamCoverage failed (see $STAR_DIR/bamCoverage.log)"; return 1; }
     fi
 }
 
@@ -139,31 +154,46 @@ run_featurecounts() {
     if [[ "$RUN_FEATURECOUNTS" != true ]]; then
         return 0
     fi
-    
-    # Collect all BAM files
-    local -a bam_files
-    mapfile -t bam_files < <(find "$STAR_DIR" -name "*.bam" | sort)
-    
+
+    # Build the BAM list from the samplesheet. A bare `find -name "*.bam"`
+    # would silently count STAR crash leftovers (e.g. an unfinished
+    # <sample>_Aligned.sortedByCoord.out.bam) and samples already removed
+    # from the samplesheet.
+    local -a bam_files=() missing_samples=()
+    local sample _group _control _target _fq1 _fq2
+    while IFS=, read -r sample _group _control _target _fq1 _fq2 || [[ -n "${sample:-}" ]]; do
+        [[ "$sample" == "sample" || -z "$sample" ]] && continue
+        if [[ -s "$STAR_DIR/${sample}.bam" ]]; then
+            bam_files+=("$STAR_DIR/${sample}.bam")
+        else
+            missing_samples+=("$sample")
+        fi
+    done < <(tail -n +2 "$SAMPLESHEET" | tr -d '\r')
+
+    if [[ ${#missing_samples[@]} -gt 0 ]]; then
+        log_warn "featureCounts: no BAM for: ${missing_samples[*]} (excluded from the count matrix)"
+    fi
     if [[ ${#bam_files[@]} -eq 0 ]]; then
-        log_warn "No BAM files found for featureCounts"
+        log_warn "No BAM files found for featureCounts (run STAR first)"
         return 0
     fi
-    
+
     log_info "Found ${#bam_files[@]} BAM files"
     local counts_file="$COUNTS_DIR/gene_counts.txt"
     if check_files_exists "$counts_file"; then
         log_info "featureCounts output exists, skipping"
         return 0
     fi
-    
+
     # Convert library type to featureCounts strandness parameter
     local strandness=0
     case "$LIBRARY_TYPE" in
         IU) strandness=0 ;;
         ISF) strandness=1 ;;
         ISR) strandness=2 ;;
+        *) log_warn "Unknown library_type '$LIBRARY_TYPE', assuming unstranded"; strandness=0 ;;
     esac
-    
+
     log_info "Running featureCounts (strandness: $strandness)"
     featureCounts -T "$THREADS" -s "$strandness" \
         -t exon -g gene_id -Q 10 -p -C --donotsort \
@@ -179,13 +209,22 @@ run_featurecounts() {
 # ============================= Main Pipeline =============================
 main() {
     local config_file="${1:-}"
-    
-    # Check dependencies
-    require_commands fastqc fastp STAR salmon samtools featureCounts multiqc python
-    
+
+    # Check dependencies.
+    # - fastqc: the FastQC step is currently disabled in helper.sh (run_preprocess)
+    # - python3 is used for the pytximport quantification step
+    require_commands fastp STAR salmon samtools featureCounts multiqc python3
+
     # Load configuration
     parse_yaml_config "$config_file"
-    
+
+    # Required config keys (fail with a clear message instead of an obscure
+    # "unbound variable" deep inside the pipeline)
+    local v
+    for v in ROOT_DIR SPECIES FASTQ_DIR SAMPLESHEET OUTDIR THREADS INDEX_ROOTDIR LIBRARY_TYPE; do
+        [[ -n "${!v:-}" ]] || die "Missing required config key in $config_file: $v"
+    done
+
     # Defaults for optional keys (protect against unset under `set -u`)
     SKIP_PREPROCESS="${SKIP_PREPROCESS:-false}"
     RUN_SALMON="${RUN_SALMON:-true}"
@@ -194,11 +233,16 @@ main() {
     RUN_QUANTIFICATION="${RUN_QUANTIFICATION:-true}"
     QUANTIFICATION_DIR="${QUANTIFICATION_DIR:-quantification}"
 
-    # set path
+    # set path — validate root BEFORE any log file inside it is opened
+    if [[ ! -d "$ROOT_DIR" ]]; then
+        echo "ERROR: root_dir does not exist: $ROOT_DIR" >&2
+        exit 1
+    fi
     OUTDIR="$ROOT_DIR/$OUTDIR"
     FASTQ_DIR="$ROOT_DIR/$FASTQ_DIR"
     SAMPLESHEET="$ROOT_DIR/$SAMPLESHEET"
     QUANTIFICATION_DIR="$ROOT_DIR/$QUANTIFICATION_DIR"
+    mkdir -p "$OUTDIR"
 
     # Setup logging
     local log_file="$ROOT_DIR/pipeline.log"
@@ -266,30 +310,32 @@ main() {
         log_info "========== Skip Salmon quantification =========="
     fi
     
-    # Phase 3: Run STAR 
+    # Phase 3: Run STAR
     if [[ "$RUN_STAR" == true ]]; then
         log_info ""
         log_info "========== Phase 3: STAR alignment =========="
         create_dirs "$STAR_DIR"
         loop_over_csv "$SAMPLESHEET" run_star
-
-        if [[ "$RUN_FEATURECOUNTS" == true ]]; then
-            log_info ""
-            log_info "========== Running featureCounts =========="
-            create_dirs "$COUNTS_DIR"
-            run_featurecounts
-         fi
     else
         log_info ""
         log_info "========== Skip STAR alignment =========="
     fi
-    
+
+    # Phase 3b: featureCounts — independent of RUN_STAR so BAMs from a
+    # previous run can be counted when only the alignment is skipped
+    if [[ "$RUN_FEATURECOUNTS" == true ]]; then
+        log_info ""
+        log_info "========== featureCounts =========="
+        create_dirs "$COUNTS_DIR"
+        run_featurecounts
+    fi
+
     # Phase 4: Quantification (pytximport)
     if [[ "$RUN_QUANTIFICATION" == true ]]; then
         log_info ""
         log_info "========== Phase 4: Quantification =========="
         create_dirs "$QUANTIFICATION_DIR"
-        python "$SCRIPT_DIR/quantification.py" "$config_file"
+        python3 "$SCRIPT_DIR/quantification.py" "$config_file"
     else
         log_info ""
         log_info "========== Skip Quantification =========="
@@ -299,7 +345,8 @@ main() {
     log_info ""
     log_info "========== Phase 5: QC =========="
     create_dirs "$MULTIQC_DIR"
-    multiqc -f "$OUTDIR" -o "$MULTIQC_DIR" --title "RNAseq Analysis" 2>/dev/null
+    multiqc -f "$OUTDIR" -o "$MULTIQC_DIR" --title "RNAseq Analysis" 2>/dev/null \
+        || log_warn "MultiQC failed (non-fatal)"
     
     log_info ""
     log_info "============================================================"

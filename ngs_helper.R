@@ -1,11 +1,37 @@
 
 library(GenomicRanges)
+library(GenomicAlignments)   # readGAlignmentPairs (compute_count)
+library(Rsamtools)           # ScanBamParam (compute_count)
+library(matrixStats)         # rowMedians/rowMaxs/rowSds (heatmap_profile, scaling)
 # library(consensusSeekeR)
 library(EnrichedHeatmap)
 library(rtracklayer)
 library(circlize)
 library(ComplexHeatmap)
 library(grid)
+library(stringr)             # str_to_sentence (heatmap_profile axis labels)
+
+
+
+#' Locate the directory of the currently running script
+#'
+#' Works in RStudio (active document), in `Rscript script.R` batch mode, and
+#' falls back to the current working directory for interactive use.
+get_script_dir <- function() {
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    doc <- rstudioapi::getActiveDocumentContext()$path
+    if (!is.null(doc) && nzchar(doc)) {
+      return(dirname(normalizePath(doc)))
+    }
+  }
+  ca <- commandArgs(trailingOnly = FALSE)
+  fa <- grep("^--file=", ca, value = TRUE)
+  if (length(fa) > 0) {
+    return(dirname(normalizePath(sub("^--file=", "", fa[1]))))
+  }
+  getwd()
+}
+
 
 
 
@@ -157,7 +183,7 @@ compute_consensus <- function(
     
     idx <- which(groups == current_group)
     current_peaks <- peak_list[idx]
-    
+
     n_samples <- length(current_peaks)
     if (n_samples < 2) {
       message(sprintf(
@@ -166,15 +192,27 @@ compute_consensus <- function(
       ))
       return(current_peaks[[1]])
     }
-    
+
+    # min_occurrence was validated against the total number of samples; clamp it
+    # to the group size so a group with fewer samples still yields a consensus
+    # instead of a silently empty GRanges.
+    min_occurrence_g <- min_occurrence
+    if (min_occurrence_g > n_samples) {
+      warning(sprintf(
+        "min_occurrence (%d) exceeds number of samples in group '%s' (%d); clamping to %d",
+        min_occurrence_g, current_group, n_samples, n_samples
+      ))
+      min_occurrence_g <- n_samples
+    }
+
     grl <- GenomicRanges::GRangesList(current_peaks)
-    
+
     if (method == "granges") {
-      
+
       cov <- GenomicRanges::coverage(grl)
       sliced <- IRanges::slice(
         x          = cov,
-        lower      = min_occurrence,
+        lower      = min_occurrence_g,
         upper      = max_coverage,
         rangesOnly = TRUE
       )
@@ -225,6 +263,11 @@ compute_consensus <- function(
 #'         columns: seqnames, start, end, width, name (optional),
 #'         count_region, count_left, count_right (for count) or
 #'         cov_region, cov_left, cov_right (for coverage)
+#'
+#' @note "coverage" is counts per kb of region (RPK-style, read length is not
+#'       taken into account) — not a per-base read-depth coverage.
+#'       Alignments are read with readGAlignmentPairs, so single-end BAMs
+#'       (or lone mates) are silently dropped; use paired-end BAMs only.
 #' @export
 compute_count <- function(
     bam_path,
@@ -287,7 +330,12 @@ compute_count <- function(
   
   # Initialize coverage df with base columns
   df_coverage <- df
-  df_coverage$cov_region <- count_region / (width(gr_region) / 1000)
+  # zero-width regions would divide by 0 → Inf/NaN; report NA instead
+  df_coverage$cov_region <- ifelse(
+    width(gr_region) > 0,
+    count_region / (width(gr_region) / 1000),
+    NA_real_
+  )
   
   if(flank_size > 0) {
     count_left   <- countOverlaps(gr_left,   gal, ignore.strand = TRUE)
@@ -355,6 +403,7 @@ compute_signal_matrix <- function(
     downstream = 3000,
     bin_size = 50,
     scale = c("none", "row", "column"),
+    keep = c(0, 0.99),
     ...
 ) {
   # Input validation
@@ -396,13 +445,23 @@ compute_signal_matrix <- function(
   }
   
   fix_map <- c("tss" = "start", "tes" = "end", "center" = "center")
-  
-  # Prepare target based on mode
+
+  # Prepare target based on mode.
+  # NOTE: GenomicRanges::resize is STRAND-AWARE — on a minus-strand range,
+  # fix="start" already anchors at the genomic end, i.e. the transcript start
+  # of a minus-strand gene. "tss"/"tes" are therefore correct on both strands
+  # as-is; do NOT add a manual strand swap here (it would double-correct).
   target <- if (mode == "scale_regions") {
     region
   } else {
-    IRanges::resize(region, width = 1, fix = fix_map[reference_point])
+    IRanges::resize(region, width = 1, fix = unname(fix_map[reference_point]))
   }
+
+  # Regions to import from bigWig: only the matrix windows are needed, so
+  # restrict the import to the targets plus their extend margins (identical
+  # values to a whole-genome import, but far less memory/time).
+  import_region <- if (mode == "scale_regions") region else target
+  import_region <- suppressWarnings(trim(import_region + max(upstream, downstream)))
   
   
   
@@ -414,18 +473,20 @@ compute_signal_matrix <- function(
     # Import from bigWig files
     mat_list <- lapply(seq_along(signal), function(j) {
       message("Importing: ", sample_names[j], " from ", basename(signal[j]))
-      bw <- rtracklayer::import(signal[j])
+      bw <- rtracklayer::import(signal[j], which = import_region)
       mat <- normalizeToMatrix(
         bw, target,
         value_column = "score",
         extend = c(upstream, downstream),
         mean_mode = "w0",
-        w = bin_size
+        w = bin_size,
+        keep = keep,
+        ...
       )
       return(mat)
     })
     names(mat_list) <- sample_names
-    
+
   } else if (signal_input_type == "granges_list") {
     # Import from GRangesList
     mat_list <- lapply(seq_along(signal), function(j) {
@@ -436,8 +497,8 @@ compute_signal_matrix <- function(
         value_column = "score",
         extend = c(upstream, downstream),
         mean_mode = "w0",
-        w = bin_size, 
-        keep=c(0, 0.99),
+        w = bin_size,
+        keep = keep,
         ...
       )
       return(mat)
@@ -445,13 +506,15 @@ compute_signal_matrix <- function(
     names(mat_list) <- sample_names
   }
   
-  # Apply scaling across ALL matrices using global mean/sd
+  # Apply scaling across ALL matrices
   if (scale == "row") {
-    # Combine all matrices to compute global row statistics
-    all_values <- do.call(rbind, lapply(mat_list, function(m) as.vector(m)))
-    global_mean <- mean(all_values, na.rm = TRUE)
-    global_sd <- sd(all_values, na.rm = TRUE)
-    mat_list <- lapply(mat_list, function(mat) (mat - global_mean) / global_sd)
+    # Per-row z-score within each matrix (rows = regions, columns = bins)
+    mat_list <- lapply(mat_list, function(mat) {
+      row_means <- matrixStats::rowMeans2(mat, na.rm = TRUE)
+      row_sds   <- matrixStats::rowSds(mat, na.rm = TRUE)
+      row_sds[!is.finite(row_sds) | row_sds == 0] <- NA_real_
+      sweep(sweep(mat, 1, row_means, "-"), 1, row_sds, "/")
+    })
   } else if (scale == "column") {
     # Combine all matrices to compute global column statistics
     all_mat <- do.call(cbind, mat_list)
@@ -495,9 +558,8 @@ compute_signal_matrix <- function(
 #' @param sort_by Method for sorting rows: "mean", "median", "max", or "none" (default: "mean")
 #' @param scale Scaling method: "none", "row", or "column" (default: "none")
 #' @param profile_height Height of the top enrichment profile annotation (default: unit(2, "cm"))
-#' @param return_granges Whether to return granges along with the plot (default: FALSE)
 #' @param ... Additional arguments passed to EnrichedHeatmap
-#' @return Returns list with heatmap, granges, and clusters.
+#' @return List with heatmap, granges (when computed from regions), and clusters.
 #' @export
 heatmap_profile <- function(
     signal,
@@ -660,13 +722,15 @@ heatmap_profile <- function(
   cluster_assignment <- NULL
   
   if (sort_by != "none") {
-    val <- switch(sort_by, 
+    val <- switch(sort_by,
                   mean = rowMeans(ref_mat, na.rm = TRUE),
-                  median = apply(ref_mat, 1, median, na.rm = TRUE),
-                  max = apply(ref_mat, 1, max, na.rm = TRUE))
+                  median = matrixStats::rowMedians(ref_mat, na.rm = TRUE),
+                  max = matrixStats::rowMaxs(ref_mat, na.rm = TRUE))
     row_order <- order(val, decreasing = TRUE)
   }
-  
+
+  cluster_sorted <- NULL
+
   if (!is.na(kmeans)) {
     # Remove rows with NA/NaN/Inf values before kmeans
     valid_rows <- apply(ref_mat, 1, function(x) all(is.finite(x)))
@@ -680,25 +744,32 @@ heatmap_profile <- function(
     }
     set.seed(42)
     km <- kmeans(ref_mat_clean, centers = kmeans, nstart = 25)
+    # km$cluster is indexed over the rows of ref_mat_clean (1..n_valid), NOT
+    # over the original matrix rows; keep the sorted permutation explicit so
+    # every downstream use stays aligned with row_order.
     cluster_assignment <- km$cluster
-    row_order <- valid_indices[order(cluster_assignment, rowMeans(ref_mat_clean, na.rm = TRUE), decreasing = c(FALSE, TRUE))]
-    cluster_split <- paste0("Cluster ", cluster_assignment[order(cluster_assignment, rowMeans(ref_mat_clean, na.rm = TRUE), decreasing = c(FALSE, TRUE))])
+    ord <- order(cluster_assignment, rowMeans(ref_mat_clean, na.rm = TRUE), decreasing = c(FALSE, TRUE))
+    row_order <- valid_indices[ord]
+    cluster_split <- paste0("Cluster ", cluster_assignment[ord])
+    cluster_sorted <- cluster_assignment[ord]
     cluster_colors <- c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00",
                         "#FFFF33", "#A65628", "#F781BF", "#999999")[1:kmeans]
   } else {
     cluster_colors <- "firebrick"
     cluster_assignment <- NULL
   }
-  
+
   mat_list <- lapply(mat_list, function(m) m[row_order, , drop = FALSE])
 
-  
+
   # Step 5: Y-axis range and color scale
-  # Bug fix 1: Calculate ylim per cluster when kmeans is enabled
-  if (!is.na(kmeans) && !is.null(cluster_assignment)) {
+  # all_vals is needed by the color-scale fallback in BOTH branches
+  all_vals <- unlist(lapply(mat_list, function(x) colMeans(x, na.rm = TRUE)))
+
+  if (!is.null(cluster_sorted)) {
     # Calculate ylim for each cluster separately
-    cluster_ylims <- lapply(unique(cluster_assignment), function(k) {
-      cluster_rows <- which(cluster_assignment == k)
+    cluster_ylims <- lapply(unique(cluster_sorted), function(k) {
+      cluster_rows <- which(cluster_sorted == k)
       cluster_mats <- lapply(mat_list, function(m) m[cluster_rows, , drop = FALSE])
       cluster_vals <- unlist(lapply(cluster_mats, function(x) colMeans(x, na.rm = TRUE)))
       c(quantile(cluster_vals, 0.01, na.rm = TRUE), quantile(cluster_vals, 0.99, na.rm = TRUE))
@@ -708,7 +779,6 @@ heatmap_profile <- function(
     global_max <- max(sapply(cluster_ylims, `[`, 2))
     ylim_shared <- c(global_min - abs(global_min) * 0.1, global_max * 1.2)
   } else {
-    all_vals <- unlist(lapply(mat_list, function(x) colMeans(x, na.rm = TRUE)))
     min_limit <- quantile(all_vals, 0.01, na.rm = TRUE)
     max_limit <- quantile(all_vals, 0.99, na.rm = TRUE)
     ylim_shared <- c(min_limit - abs(min_limit) * 0.1, max_limit * 1.2)
@@ -813,7 +883,7 @@ heatmap_profile <- function(
   
   return(list(heatmap = p,
               granges = if (!is.null(all_regions)) all_regions[row_order] else NULL,
-              clusters = cluster_assignment[row_order]
+              clusters = cluster_sorted
   )
   )
 }

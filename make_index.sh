@@ -2,6 +2,10 @@
 # ubuntu_26.04_LTS
 # last edited at 2026-07-08 by Hao He
 
+# Fail on any error: a silently-continuing download left truncated inputs
+# behind, and the "[ ! -f x ]" checks then reused them on every later run.
+set -euo pipefail
+
 # conda activate ngs
 # conda env export --no-builds | grep -v "^prefix: " > ngs.yml
 # conda env create -f ngs.yml
@@ -37,36 +41,49 @@ cdna_link=https://ftp.ensembl.org/pub/release-116/fasta/drosophila_melanogaster/
 # target_dir=/mnt/d/index/hs/v49
 target_dir=/mnt/d/index/fly
 # target_dir=/mnt/d/index/cel   # uncomment for C. elegans
-root_dir=$target_dir && mkdir -p $root_dir && cd $root_dir && echo ">>>>>> start to processing <<<<<<<"1
+root_dir=$target_dir
+mkdir -p "$root_dir"
+cd "$root_dir"
+echo ">>>>>> start to processing <<<<<<<"
 
 
 #################################  process data  #################################
 
-# # convert to bgzip format
-# gunzip -c $fasta_gz | bgzip -c > bgzip$fasta_gz && mv bgzip$fasta_gz $fasta_gz
-# # index .fa.gz files
-# samtools faidx $fasta_gz
-
+# download to "<name>.part" and only then move into place: an interrupted wget
+# can no longer leave a truncated file that later runs treat as complete
+download() {
+    local url="$1" out="$2"
+    if [[ ! -s "$out" ]]; then
+        echo "downloading $(basename "$out")"
+        wget -O "${out}.part" "$url"
+        mv -f "${out}.part" "$out"
+    fi
+}
 
 # fasta
 fasta_gz=$(basename "$fasta_link")
 fasta=${fasta_gz%.gz}
-[ ! -f "$fasta_gz" ] && echo "downloading fasta" && wget $fasta_link -O $fasta_gz
-[ ! -f "${fasta}.fai" ] && gunzip -k $fasta_gz && samtools faidx $fasta
+download "$fasta_link" "$fasta_gz"
+if [[ ! -s "${fasta}.fai" ]]; then
+    gunzip -kf "$fasta_gz"
+    samtools faidx "$fasta"
+fi
 
 gtf_gz=$(basename "$gtf_link")
 gtf=${gtf_gz%.gz}
-[ ! -f "$gtf_gz" ] && echo "downloading gtf" && wget $gtf_link -O $gtf_gz
-[ ! -f "$gtf" ] && gunzip -k $gtf_gz
+download "$gtf_link" "$gtf_gz"
+if [[ ! -s "$gtf" ]]; then
+    gunzip -kf "$gtf_gz"
+fi
 
 # cdna
 if [ -z "${cdna_link+x}" ]; then
     echo "cdna_link does not exist, extract cdna first"
     cdna_gz=cdna.fa.gz
-	gffread -w - -g $fasta_gz $gtf_gz | gzip > "$cdna_gz"
+    gffread -w - -g "$fasta_gz" "$gtf_gz" | gzip > "$cdna_gz"
 else
     cdna_gz=$(basename "$cdna_link")
-	[ ! -f "$cdna_gz" ] && echo "downloading cdna" && wget $cdna_link -O $cdna_gz
+    download "$cdna_link" "$cdna_gz"
 fi
 
 
@@ -97,7 +114,7 @@ fi
 #################################  bowtie2 index  #################################
 # note that bowtie2 is not a junction aware aligner
 mkdir -p bowtie2
-bowtie2-build --threads 8 $fasta_gz bowtie2/bowtie2
+bowtie2-build --threads 8 "$fasta_gz" bowtie2/bowtie2
 
 
 #################################  star index  #################################

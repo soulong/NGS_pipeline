@@ -33,6 +33,15 @@ bash $script_dir/run_cuttag.sh config.yml
 - For complicated genomic setting, refer to `helper.sh`
 - For SpikeFree method, refer to`spike_free_normalization.R`.
 - For custom bed region, please edit `config.yml`
+- `norm_method` accepts a comma-separated list (e.g. `norm_method: CPM, Spike`);
+  each method runs in turn and produces its own `<sample>.<method>.bw` BigWig,
+  BigWig QC/heatmap outputs and a `statistics.csv` row (one per sample per
+  method). Methods with missing prerequisites (spike-in alignment for `Spike`,
+  the scale-factor file for `SpikeFree`) are skipped with a warning.
+- BigWig generation is guarded by `<file>.bw.done` markers (resume safety): a
+  BigWig is only skipped when both the marker and a non-empty BigWig exist, so
+  an interrupted `bamCoverage` never leaves a truncated BigWig behind. Delete
+  a sample's `.bw.done` to force regeneration.
 
 ## Heatmap options (config.yml)
 - `heatmap_binsize` (default `50`) — bp per bin for `computeMatrix`. Larger values reduce memory and runtime for big BED files: memory ≈ n_regions × n_samples × (window/binsize) × 8 bytes. 100k regions × 30 samples × 120 bins ≈ 3 GB at binSize 50.

@@ -3,6 +3,7 @@ library(tidyverse)
 library(furrr)
 library(clusterProfiler)
 library(ComplexHeatmap)
+library(matrixStats)   # rowSds/colSds (scale_mat); not attached by tidyverse
 
 
 #' @param counts a numeric vector of raw counts (e.g. a sample column)
@@ -50,13 +51,19 @@ scale_mat <- function(mat, by=c("row","column","none")) {
   
   if(by[1]=="row") {
     if(any(is.na(mat))) {
-      mat = (mat - rowMeans(mat, na.rm=T))/rowSds(mat, na.rm=T)
+      # matrixStats::rowSds — base R has no rowSds; without this package the
+      # NA branch crashed with "could not find function rowSds"
+      rs <- matrixStats::rowSds(mat, na.rm=T)
+      rs[!is.finite(rs) | rs == 0] <- NA_real_   # constant/all-NA rows
+      mat = (mat - rowMeans(mat, na.rm=T))/rs
     } else mat = t(scale(t(mat)))
   }
-  
+
   if(by[1]=="column") {
     if(any(is.na(mat))) {
-      mat = t((t(mat) - colMeans(mat, na.rm=T))/colSds(mat, na.rm=T))
+      cs <- matrixStats::colSds(mat, na.rm=T)
+      cs[!is.finite(cs) | cs == 0] <- NA_real_
+      mat = t((t(mat) - colMeans(mat, na.rm=T))/cs)
     } else mat = scale(mat)
   }
   
@@ -81,20 +88,27 @@ annoCol_from_sample_info <- function(
     # split heatmap column by sample group
     if(!is.factor(sample_df[[split_by]][1])) {
       print("convert contrast to factor")
-      sample_df[[split_by]] <- sample_df[[split_by]] %>% 
-        factor(levels=unique(.[[split_by]])) }
-    #
-    sample_split <- sample_df[["contrast"]]
-    sample_split_color <- 
-      colorRampPalette(brewer.pal(8,"Dark2"))(length(unique(sample_split))) %>% 
+      # NB: `.` inside a magrittr pipe is the piped VECTOR, not the data
+      # frame — `unique(.[[split_by]])` here would subscript out of bounds
+      sample_df[[split_by]] <- factor(sample_df[[split_by]],
+                                      levels=unique(sample_df[[split_by]]))
+    }
+    # use the split_by column itself — the old hard-coded "contrast" made
+    # every other grouping column produce NULL / an empty annotation
+    sample_split <- sample_df[[split_by]]
+    sample_split_color <-
+      colorRampPalette(brewer.pal(8,"Dark2"))(length(unique(sample_split))) %>%
       set_names(unique(sample_split))
     #
-    anno_sample <- HeatmapAnnotation(contrast=anno_block(
+    anno_block_obj <- anno_block(
       labels=unique(sample_split), labels_gp=gpar(fontsize=5),
-      gp=gpar(fill=sample_split_color)), which="column")
-    
-    return(list(anno_sample=anno_sample, 
-                sample_split=sample_split, 
+      gp=gpar(fill=sample_split_color))
+    anno_sample <- do.call(
+      HeatmapAnnotation,
+      c(setNames(list(anno_block_obj), split_by), list(which="column")))
+
+    return(list(anno_sample=anno_sample,
+                sample_split=sample_split,
                 sample_split_color=sample_split_color))
   } else {
     # anno for each sample
@@ -169,83 +183,97 @@ anno_gglist <- function(
 
 #' @param gene_list list of character genes
 #' @param geneset_list list of dataframe geneset
-enrich_ora_list <- function(gene_list, geneset_list) {
+#' @param species organism label written into the enrichResult slot;
+#'        defaults to a global `species` for backward compatibility
+enrich_ora_list <- function(gene_list, geneset_list,
+                            species=get0("species", envir=.GlobalEnv, ifnotfound=NULL)) {
+  if (is.null(species)) {
+    stop("`species` is not set: pass it as an argument or define it globally")
+  }
   enrich_result <- list()
   for(i in seq_along(gene_list)) {
     print(str_glue(
       ">>>>>>>> ORA enrichment on: {names(gene_list)[i]}"))
     genes <- gene_list[[i]]
-    
+
     if(length(genes) < 20) next
     ora_list <- future_map(
-      geneset_list, 
-      \(x) enricher(gene = genes, 
-                    pvalueCutoff = 0.2, qvalueCutoff = 0.7, 
+      geneset_list,
+      \(x) enricher(gene = genes,
+                    pvalueCutoff = 0.2, qvalueCutoff = 0.7,
                     minGSSize = 10, maxGSSize = 500,
                     TERM2GENE = x$term2gene,
                     TERM2NAME = x$term2name),
       .options = furrr_options(seed = T)
     )
-    # merge different geneset_list 
+    # merge different geneset_list
     ora_merge <- ora_list[[1]]
     ora_merge@organism <- species
-    ora_merge@result <- ora_list %>% 
+    ora_merge@result <- ora_list %>%
       map(\(x) slot(x, "result")) %>%
       purrr::reduce(.f = bind_rows)
-    ora_merge@geneSets <- ora_list %>% 
+    ora_merge@geneSets <- ora_list %>%
       map(\(x) slot(x, "geneSets")) %>%
       purrr::reduce(.f = c)
-    # split each database
-    ora_merge@result <- ora_merge@result %>% 
-      mutate(Category = map_chr(
-        Description, \(x) str_split(x, "[_]", n=2, simplify=T) %>% .[1]),
-        Description = map_chr(
-          Description, \(x) str_split(x, "[_]", n=2, simplify=T) %>% .[2]) %>%
-          map_chr(\(x) str_replace_all(x, "_", " ")) %>%
-          map_chr(str_to_sentence) ) #%>%
-    # mutate(Category = factor(Category, levels=unique(.$Category)))
-    
+    # split each database ("DB_term name" -> Category = DB, Description = term)
+    # str_replace fallback keeps descriptions without an underscore intact
+    # (str_split(...)[2] returned NA and crashed map_chr for those)
+    ora_merge@result <- ora_merge@result %>%
+      mutate(Category = str_replace(Description, "_.*$", ""),
+             Description = if_else(str_detect(Description, "_"),
+                                   str_replace(Description, "^[^_]*_", ""),
+                                   Description)) %>%
+      mutate(Description = map_chr(
+        Description, \(x) str_replace_all(x, "_", " ")) %>%
+        map_chr(str_to_sentence))
+
     enrich_result[[names(gene_list)[i]]] <- ora_merge
   }
-  
+
   return(enrich_result)
 }
 
 
 
-#' @param gene_list_ranked list of ranked named gene character 
+#' @param gene_list_ranked list of ranked named gene character
 #' @param geneset_list list of dataframe geneset
-enrich_gsea_list <- function(gene_list_ranked, geneset_list) {
+#' @param species organism label written into the GSEA result slot;
+#'        defaults to a global `species` for backward compatibility
+enrich_gsea_list <- function(gene_list_ranked, geneset_list,
+                             species=get0("species", envir=.GlobalEnv, ifnotfound=NULL)) {
+  if (is.null(species)) {
+    stop("`species` is not set: pass it as an argument or define it globally")
+  }
   enrich_result <- list()
   for(i in seq_along(gene_list_ranked)) {
     print(str_glue(">>>>>>>> GSEA enrichment on: {names(gene_list_ranked)[i]}"))
-    
+
     genelist <- gene_list_ranked[[i]] %>% na.omit() %>% .[is.finite(.)]
     if(length(genelist) < 50) next
-    
+
     gsea_list <- future_map(geneset_list, \(x) GSEA(
-      genelist, minGSSize = 10, maxGSSize = 500, pvalueCutoff = 1, 
-      TERM2GENE = x$term2gene, TERM2NAME = x$term2name, 
+      genelist, minGSSize = 10, maxGSSize = 500, pvalueCutoff = 1,
+      TERM2GENE = x$term2gene, TERM2NAME = x$term2name,
       seed=T, verbose=F),
       .options = furrr_options(seed = T) )
-    # merge geneset_list 
+    # merge geneset_list
     gsea <- gsea_list[[1]]
     gsea@organism <- species
-    gsea@result <- gsea_list %>% 
+    gsea@result <- gsea_list %>%
       map(\(x) slot(x, "result")) %>%
       purrr::reduce(.f = bind_rows)
-    gsea@geneSets <- gsea_list %>% 
+    gsea@geneSets <- gsea_list %>%
       map(\(x) slot(x, "geneSets")) %>%
       purrr::reduce(.f = c)
-    # split each database
+    # split each database ("DB_term name" -> Category = DB, Description = term)
     gsea@result <- gsea@result %>%
-      mutate(Category = map_chr(
-        Description, \(x) str_split(x, "_", n=2, simplify=T) %>% .[1]),
-        Description = map_chr(
-          Description, \(x) str_split(x, "_", n=2, simplify=T) %>% .[2]) %>%
-          map_chr(\(x) str_replace_all(x, "_", " ")) %>%
-          map_chr(str_to_sentence) ) #%>%
-    # mutate(Category = factor(Category, levels=unique(.$Category)))
+      mutate(Category = str_replace(Description, "_.*$", ""),
+             Description = if_else(str_detect(Description, "_"),
+                                   str_replace(Description, "^[^_]*_", ""),
+                                   Description)) %>%
+      mutate(Description = map_chr(
+        Description, \(x) str_replace_all(x, "_", " ")) %>%
+        map_chr(str_to_sentence))
     
     # to list
     enrich_result[[names(gene_list_ranked)[i]]] <- gsea
@@ -296,10 +324,16 @@ plot_volcano <- function(res,
   # take sig genes
   df.sig <- filter(df, padj < padj_thred, abs(log2FoldChange) > log2(fc_thred)) %>%
     mutate(direction=if_else(log2FoldChange > 0, "up", "down"))
-  # sample un-sig genes,  fo reducing rendering points
-  df.unsig <- filter(df, padj >= padj_thred) %>%
-    sample_n(size=ns_resampling) %>%
+  # sample un-sig genes, fo reducing rendering points.
+  # "unsig" for display = everything NOT in df.sig: padj-below-threshold genes
+  # with a small fold-change used to fall through BOTH filters and vanish
+  # from the plot entirely. Sampling only happens when there are enough
+  # points (sample_n crashed on small datasets otherwise).
+  df.unsig <- filter(df, padj >= padj_thred | abs(log2FoldChange) <= log2(fc_thred)) %>%
     mutate(direction="ns")
+  if (nrow(df.unsig) > ns_resampling) {
+    df.unsig <- sample_n(df.unsig, size=ns_resampling)
+  }
   # merge sig and un-sig
   df.merge <- bind_rows(df.sig, df.unsig)
   
@@ -331,7 +365,9 @@ plot_volcano <- function(res,
            "padj_threshold: {padj_thred}, FoldChange_threshold: {fc_thred}")) +
     theme_bw()
   
-  if("ggrastr" %in% installed.packages()) plot <- ggrastr::rasterize(plot)
+  # requireNamespace: installed.packages() rescans every library (seconds)
+  # on each call; requireNamespace is the cheap, intended check
+  if(requireNamespace("ggrastr", quietly=TRUE)) plot <- ggrastr::rasterize(plot)
   
   return(plot)
 }
@@ -519,8 +555,11 @@ plot_enrich_gsea <- function(enrichment,
       stop("facet_scales must be one of free, free_x, free_y, fixed")
   }
   
-  # count core enrichment genes
-  enrichment$Core_Count <- map_int(enrichment$core_enrichment, ~ length(str_split(.x, fixed("/"), simplify = T)))
+  # count core enrichment genes (NA/empty core_enrichment -> 0, not 1)
+  enrichment$Core_Count <- map_int(enrichment$core_enrichment, ~ {
+    if (is.na(.x) || !nzchar(.x)) 0L
+    else length(str_split(.x, fixed("/"), simplify = T))
+  })
   
   # group facet
   if(!is.null(facet_by)) {

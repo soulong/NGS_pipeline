@@ -121,14 +121,42 @@ get_base_fq_name() {
     echo "$name"
 }
 
+# ============================= Step Completion Markers =============================
+# Resume-safety: "-s file" cannot distinguish a finished product from a truncated
+# file left behind by an interrupted run. Steps that stream large outputs
+# (fastp, bamCoverage, computeMatrix, ...) should be guarded by these markers:
+# skip only when BOTH the marker and the product exist; touch the marker only
+# AFTER the producing command exited successfully.
+is_done() {
+    # Usage: is_done <product_path>
+    [[ -f "${1}.done" && -s "$1" ]]
+}
+
+mark_done() {
+    # Usage: mark_done <product_path>
+    touch "${1}.done"
+}
+
 # ============================= Process Management =============================
 setup_trap() {
     # Setup trap for interrupt signals with cleanup
     # Usage: setup_trap <cleanup_pattern>
-    # Example: setup_trap "output_dir/sample*"
+    # Example: setup_trap "output_dir/sample_*"
+    # NOTE: the pattern is shell-expanded (word splitting + globbing) at trap
+    # time, so anchor globs (e.g. "sample_*" instead of "sample*") to avoid
+    # deleting sibling samples that share a prefix. Paths containing spaces
+    # are not supported; pass an exact path list separated by spaces instead.
     local cleanup_pattern="$1"
-    
-    trap "echo 'Interrupted! Cleaning up...'; rm -rf $cleanup_pattern; exit 1" SIGINT SIGTERM
+
+    _CLEANUP_PATTERN_="$cleanup_pattern"
+    trap _cleanup_on_interrupt SIGINT SIGTERM
+}
+
+_cleanup_on_interrupt() {
+    echo 'Interrupted! Cleaning up...'
+    # shellcheck disable=SC2086 -- intentional globbing/word-splitting of the caller pattern
+    rm -rf -- $_CLEANUP_PATTERN_
+    exit 1
 }
 
 clear_trap() {
@@ -143,6 +171,9 @@ loop_over_csv() {
     # Safely read CSV file, handling DOS line endings and headers
     # Usage: loop_over_csv <csv_file> <callback_function>
     # Callback receives: sample group control target fq1 fq2
+    # NOTE: fail-fast by design — a non-zero callback return aborts the whole
+    # pipeline (set -e). Per-sample skip-on-error is deliberately not used
+    # because it hides systematic problems.
     local file="$1"
     local callback="$2"
     
@@ -151,6 +182,9 @@ loop_over_csv() {
         [[ "$sample" == "sample" ]] && continue
         # Skip empty lines
         [[ -z "$sample" ]] && continue
+        if [[ "$fq2" == "NA" ]]; then
+            log_warn "[$sample] mate fq2 is 'NA' in samplesheet; preprocessing will fail for this sample"
+        fi
         
         "$callback" "$sample" "$group" "$control" "$target" "$fq1" "$fq2"
     done < <(tail -n +2 "$file" | tr -d '\r')
@@ -214,6 +248,11 @@ generate_samplesheet() {
 
 
 # ============================= Statistics Extraction =============================
+# All extract_* functions FAIL (non-zero exit, no fake zeros) when the input is
+# missing or cannot be parsed. Callers must check the exit status, e.g.:
+#   local n
+#   n=$(extract_flagstat_value "$fs" "mapped" 1) || die "[$sample] cannot read $fs"
+# Never write `local x=$(extract_...)` — `local` masks the exit status.
 extract_flagstat_value() {
     # Extract value from samtools flagstat output
     # Usage: extract_flagstat_value <flagstat_file> <pattern> [column]
@@ -221,16 +260,22 @@ extract_flagstat_value() {
     local file="$1"
     local pattern="$2"
     local col="${3:-1}"
-    
+
     if [[ ! -f "$file" ]]; then
-        log_warn "Flagstat file not found: $file"
-        echo "0"
+        log_error "Flagstat file not found: $file"
         return 1
     fi
-    
-    awk -v p="$pattern" -v c="$col" '
+
+    local val
+    val=$(awk -v p="$pattern" -v c="$col" '
         $0 ~ p { print $c; exit }
-    ' "$file"
+    ' "$file")
+
+    if [[ -z "$val" ]]; then
+        log_error "Pattern '$pattern' (column $col) not found in $file"
+        return 1
+    fi
+    echo "$val"
 }
 
 extract_salmon_stats() {
@@ -239,24 +284,29 @@ extract_salmon_stats() {
     # Returns: "total_reads mapped_reads mapping_rate"
     local salmon_dir="$1"
     local log_file="$salmon_dir/logs/salmon_quant.log"
-    
+
     if [[ ! -f "$log_file" ]]; then
-        echo "0 0 0.0"
+        log_error "Salmon log not found: $log_file"
         return 1
     fi
-    
+
     local total_reads mapped_reads mapping_rate
-    
+
     # Extract total fragments processed
-    total_reads=$(grep -oP "Observed \K[0-9,]+" "$log_file" | tr -d ',' || echo "0")
-    
+    total_reads=$(grep -oP "Observed \K[0-9,]+" "$log_file" | tr -d ',' || true)
+
     # Extract mapping rate
-    mapping_rate=$(grep -oP "Mapping rate = \K[0-9.]+%" "$log_file" | tr -d '%' || echo "0.0")
-    
+    mapping_rate=$(grep -oP "Mapping rate = \K[0-9.]+%" "$log_file" | tr -d '%' || true)
+
+    if [[ -z "$total_reads" || -z "$mapping_rate" ]]; then
+        log_error "Could not parse reads / mapping rate from $log_file"
+        return 1
+    fi
+
     # Calculate mapped reads
     mapped_reads=$(awk -v total="$total_reads" -v rate="$mapping_rate" \
         'BEGIN{printf "%.0f", total * rate / 100}')
-    
+
     echo "$total_reads $mapped_reads $mapping_rate"
 }
 
@@ -265,20 +315,25 @@ extract_star_stats() {
     # Usage: extract_star_stats <star_log_file>
     # Returns: "total_reads uniquely_mapped multi_mapped unmapped"
     local log_file="$1"
-    
+
     if [[ ! -f "$log_file" ]]; then
-        echo "0 0 0 0"
+        log_error "STAR log not found: $log_file"
         return 1
     fi
-    
+
     local total uniquely multi unmapped
-    
-    total=$(grep "Number of input reads" "$log_file" | awk '{print $NF}')
-    uniquely=$(grep "Uniquely mapped reads number" "$log_file" | awk '{print $NF}')
-    multi=$(grep "Number of reads mapped to multiple loci" "$log_file" | awk '{print $NF}')
-    unmapped=$(grep "Number of reads unmapped: too short" "$log_file" | awk '{print $NF}')
-    
-    echo "${total:-0} ${uniquely:-0} ${multi:-0} ${unmapped:-0}"
+
+    total=$(awk '/Number of input reads/ {print $NF}' "$log_file")
+    uniquely=$(awk '/Uniquely mapped reads number/ {print $NF}' "$log_file")
+    multi=$(awk '/Number of reads mapped to multiple loci/ {print $NF}' "$log_file")
+    unmapped=$(awk '/Number of reads unmapped: too short/ {print $NF}' "$log_file")
+
+    if [[ -z "$total" ]]; then
+        log_error "Could not parse 'Number of input reads' from $log_file"
+        return 1
+    fi
+
+    echo "${total} ${uniquely:-0} ${multi:-0} ${unmapped:-0}"
 }
 
 # ============================= Common Analysis Functions =============================
@@ -310,19 +365,23 @@ run_preprocess() {
     # fastp trimming
     local clean_r1="$FASTP_DIR/${sample}_R1.fq.gz"
     local clean_r2="$FASTP_DIR/${sample}_R2.fq.gz"
-    if check_files_exists "$clean_r1" "$clean_r2"; then
+    if is_done "$clean_r1" && is_done "$clean_r2"; then
         log_info "[$sample] Trimming completed"
     else
         log_info "[$sample] Running fastp trim"
-        setup_trap "$FASTP_DIR/${sample}*"
+        # exact output list (no trailing glob): a bare "${sample}*" would also
+        # delete sibling samples sharing the prefix (sample1* matches sample10*)
+        setup_trap "$FASTP_DIR/${sample}_R1.fq.gz $FASTP_DIR/${sample}_R2.fq.gz $FASTP_DIR/${sample}.json $FASTP_DIR/${sample}.html"
         fastp -w "$THREADS" -i "$r1" -I "$r2" -o "$clean_r1" -O "$clean_r2" \
             -j "$FASTP_DIR/${sample}.json" -h "$FASTP_DIR/${sample}.html" \
-            -R "$sample" 2>> "$FASTP_DIR/fastp.log" || { 
+            -R "$sample" 2>> "$FASTP_DIR/fastp.log" || {
             log_error "[$sample] fastp failed"
             clear_trap
             return 1
         }
         clear_trap
+        mark_done "$clean_r1"
+        mark_done "$clean_r2"
     fi
 }
 
@@ -345,14 +404,17 @@ calculate_scale_factor() {
             if [[ $filtered_reads -gt 0 ]]; then
                 scale_factor=$(awk "BEGIN{printf \"%.6f\", 1e6 / $filtered_reads}")
             else
-                log_warn "Filtered reads = 0, using scale factor 1.0"
+                # A zero read count means the alignment/filtering steps failed
+                # upstream; silently emitting scale factor 1.0 would produce
+                # UNNORMALIZED signal that looks like a valid result.
+                die "[$sample] Filtered reads = 0 for CPM normalization; refusing to emit scale factor 1.0"
             fi
             ;;
         Spike)
             if [[ $spike_reads -gt 0 ]]; then
                 scale_factor=$(awk "BEGIN{printf \"%.6f\", 1e4 / $spike_reads}")
             else
-                log_warn "Spike reads = 0, using scale factor 1.0"
+                die "[$sample] Spike reads = 0 for Spike normalization; refusing to emit scale factor 1.0"
             fi
             ;;
         SpikeFree)
@@ -381,8 +443,7 @@ calculate_scale_factor() {
                 die "Sample $sample has invalid or missing (NA) scaling factor in $spike_free_file"
             fi
             if [[ $filtered_reads -le 0 || "$sf_raw" == "0" ]]; then
-                log_warn "Filtered reads ($filtered_reads) or SF ($sf_raw) is zero, using scale factor 1.0"
-                scale_factor="1.000000"
+                die "[$sample] Filtered reads ($filtered_reads) or SF ($sf_raw) is zero; refusing to emit scale factor 1.0"
             else
                 scale_factor=$(awk -v fr="$filtered_reads" -v sf="$sf_raw" \
                     'BEGIN{printf "%.6f", 1e6 / (fr * sf)}')
@@ -400,7 +461,8 @@ calculate_scale_factor() {
 # ============================= Peak Processing =============================
 merge_peakfiles() {
     # Merge multiple peak files into consensus BED
-    # Usage: merge_peakfiles --input-peaks file1 file2 --output-bed output.bed --chrom-size chrom.sizes
+    # Usage: merge_peakfiles --input-peaks "file1 file2 [file3 ...]" --output-bed output.bed --chrom-size chrom.sizes
+    # NOTE: --input-peaks takes ONE quoted, space-separated list of files.
     local input_peaks=""
     local output_bed=""
     local chrom_size=""
@@ -453,7 +515,7 @@ merge_peakfiles() {
     for pf in "${peak_files[@]}"; do
         if [[ ! -f "$pf" ]]; then
             log_warn "Peak file not found: $pf"
-            ((missing++))
+            missing=$((missing + 1))
         fi
     done
 
@@ -465,11 +527,12 @@ merge_peakfiles() {
     # log_info "Merging ${#peak_files[@]} peak files into $output_bed"
 
     # Merge peaks: concatenate -> extract coords -> sort -> merge -> sort by genome
+    # (no stderr suppression: a broken bedtools/chrom-size must be visible in the log)
     cat "${peak_files[@]}" | \
         cut -f1-3 | \
-        bedtools sort 2>/dev/null | \
-        bedtools merge 2>/dev/null | \
-        bedtools sort -g "$chrom_size" 2>/dev/null > "$output_bed"
+        bedtools sort | \
+        bedtools merge | \
+        bedtools sort -g "$chrom_size" > "$output_bed"
 
     if [[ -s "$output_bed" ]]; then
         local count
@@ -499,7 +562,9 @@ setup_genome() {
             FASTA="${INDEX_DIR}/chm13v2.0.fa.gz"
             GTF="${INDEX_DIR}/chm13v2.0.gtf.gz"
             CHROM_SIZES="${FASTA}.fai"
-            GSIZE=2913022398
+            # T2T-CHM13v2.0 total (chm13 + Y, ~3.117 Gb); the old value here
+            # was a copy of the hs GRCh38 size and wrong for T2T
+            GSIZE=3117292070
             ;;
         hs)
             INDEX_DIR="$index_rootdir/hs/v49"
@@ -529,7 +594,19 @@ setup_genome() {
             CHROM_SIZES="${FASTA}.fai"
             GSIZE=100286401
             ;;
+        *)
+            die "Unknown species: '$species' (supported: chm13, hs, mm, fly, cel)"
+            ;;
     esac
+
+    # Prefer the genome size computed from the actual .fai (self-consistent with
+    # the reference that was aligned against). The hardcoded values above are
+    # only a fallback for when the index has not been built yet.
+    # (The old chm13 fallback was a copy of the hs value and wrong for T2T.)
+    if [[ -f "$CHROM_SIZES" ]]; then
+        GSIZE=$(awk '{s += $2} END {printf "%.0f", s}' "$CHROM_SIZES")
+        log_info "Genome size from $CHROM_SIZES: $GSIZE"
+    fi
     
     # Setup common indices
     SPIKE_INDEX="$index_rootdir/Ecoli_novoprotein/bowtie2/bowtie2"
@@ -580,13 +657,19 @@ merge_fastq_by_sample() {
     local samples
     samples=$(awk -F',' 'NR>1 {print $25}' "$samplesheet" | sort -u)
 
-    local total=$(echo "$samples" | wc -l)
+    if [[ -z "$samples" ]]; then
+        echo "Error: no samples found in column 25 of $samplesheet" >&2
+        return 1
+    fi
+
+    local total
+    total=$(echo "$samples" | wc -l)
     local i=0
 
     echo "Found $total unique samples in $samplesheet"
 
     while IFS= read -r sample; do
-        ((i++))
+        i=$((i + 1))
         printf "\n[%2d/%d] %s\n" "$i" "$total" "$sample"
 
         # Find all runs for this sample

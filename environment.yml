@@ -2,6 +2,19 @@ name: ngs
 channels:
   - conda-forge
   - bioconda
+# NOTE: this file pins the PYTHON-side environment only (the run_*.sh shell
+# pipelines). The R analysis scripts (ngs_helper.R, rnaseq_helper.R,
+# CutTag/script/*.R, atacseq_analysis.R) run in RStudio/Rscript OUTSIDE this
+# env and need the following R/Bioconductor packages (not installable through
+# this pinned export; install via BiocManager in your R library):
+#   tidyverse, data.table, jsonlite, matrixStats, furrr, rio, janitor,
+#   patchwork, GenomicRanges, GenomicAlignments, Rsamtools, rtracklayer,
+#   EnrichedHeatmap, ComplexHeatmap, circlize, ChIPseeker, DESeq2, chromVAR,
+#   clusterProfiler, ggrepel, ggrastr, TxDb/Org packages per species
+#   (TxDb.Hsapiens.UCSC.hg38.knownGene, org.Hs.eg.db,
+#    TxDb.Celegans.UCSC.ce11.refGene, TxDb.Dmelanogaster.UCSC.dm6.ensGene,
+#    TxDb.Mmusculus.UCSC.mm39.knownGene, ...),
+#   ChIPseqSpikeInFree (GitHub: stjude/ChIPseqSpikeInFree)
 dependencies:
   - _openmp_mutex=4.5
   - _python_abi3_support=1.0

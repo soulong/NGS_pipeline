@@ -8,6 +8,10 @@ root_dir: "."
 fastq_dir: rawdata
 
 # Species: "hs" (human), "mm" (mouse), "chm13" (T2T-CHM13), "fly" (Drosophila), "cel" (C. elegans)
+# NOTE: the R-side analysis (atacseq_analysis.R) annotates with hg38 (GRCh38)
+# resources. Peaks called on chm13 (T2T) coordinates are NOT compatible with
+# hg38 gene models (Mb-level coordinate differences) — use hs/GRCh38 if you
+# need the annotation-supported analyses.
 species: chm13
 
 # Sample sheet CSV file (must contain columns: sample,group,control,target,fq1,fq2)
@@ -38,10 +42,13 @@ norm_method: CPM
 # Peak calling with MACS3
 call_peak: true
 
-# MACS3 parameters used for peak calling
-# ATACseq specific: --shift -100 --extsize 200 accounts for Tn5 transposase 9-bp duplication
-# Example: "--nomodel --shift -100 --extsize 200 -q 0.01"
-macs_parameter: --nomodel --shift -100 --extsize 200 -q 0.01
+# MACS3 parameters used for peak calling.
+# NOTE: the pipeline calls MACS with -f BAMPE (paired-end); MACS then derives
+# fragment sizes from the read pairs and IGNORES model-related flags
+# (--nomodel/--shift/--extsize — the old "Tn5 shift" values never took effect).
+# The pipeline strips them automatically; effective example: "-q 0.01",
+# or add "--broad --broad-cutoff 0.05" for broad (ATAC rarely) peaks.
+macs_parameter: -q 0.01
 
 # ============================= Index Paths =============================
 # Root directory containing genome indices
