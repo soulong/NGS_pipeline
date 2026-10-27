@@ -2,7 +2,7 @@
 
 # ============================= Basic Settings =============================
 # root directory of project
-root_dir: "/mnt/d/EED_CutTag/X101SC26064008-Z01-J011"
+root_dir: "/mnt/d/TEAD/2025-06_p62_panTEAD_brd4_h3K27ac_cuttag"
 
 # Directory containing raw FASTQ files
 fastq_dir: 01.RawData
@@ -37,9 +37,9 @@ run_spike: true
 # or "SpikeFree" (spike-free). Comma-separated list runs each in turn
 # (like peak_caller), e.g.:
 #   norm_method: CPM, Spike
-# Each method produces its own BigWig (<sample>.<method>.bw), BigWig QC and
-# heatmaps, and one statistics.csv row per sample per method. A method whose
-# prerequisites are missing is skipped with a warning:
+# Each method produces its own BigWig (<sample>.<method>.bw in 04_bigwig/),
+# BigWig QC and heatmaps, and one statistics.csv row per sample per method. A
+# method whose prerequisites are missing is skipped with a warning:
 #   Spike     -> needs spike-in alignment (run_spike: true)
 #   SpikeFree -> needs the spike-free scale factor file (spike_free_sf_file
 #                below, or result/03_bam/SpikeFree_SF.txt by default)

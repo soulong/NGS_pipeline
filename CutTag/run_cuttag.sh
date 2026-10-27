@@ -226,21 +226,29 @@ norm_prereq() {
 norm_bws_done() {
     local sample="$1" m
     for m in "${NORM_METHODS[@]}"; do
-        is_done "$ALIGN_DIR/${sample}.${m}.bw" || return 1
+        [[ -s "$BIGWIG_DIR/${sample}.${m}.bw" ]] || return 1
     done
 }
 
 generate_bigwig() {
     local sample="$1" method="$2" scale_factor="$3"
     local filtered_bam="$ALIGN_DIR/${sample}.filtered.bam"
-    local bigwig="$ALIGN_DIR/${sample}.${method}.bw"
+    local bigwig="$BIGWIG_DIR/${sample}.${method}.bw"
 
-    if ! is_done "$bigwig"; then
+    if [[ ! -s "$bigwig" ]]; then
         log_info "[$sample] Generating BigWig ($method, scale: $scale_factor)"
-        bamCoverage -b "$filtered_bam" -o "$bigwig" \
-            -p "$THREADS" --binSize 10 --scaleFactor "$scale_factor" \
-            2>>"$ALIGN_DIR/bamCoverage.log" || die "[$sample] bamCoverage failed (see $ALIGN_DIR/bamCoverage.log)"
-        mark_done "$bigwig"
+        # bamCoverage writes to a temp file that is renamed only on success and
+        # deleted on failure, so a `.bw` at the final path is always complete
+        # (no .done markers) and a failed step leaves nothing behind.
+        local bigwig_tmp="${bigwig}.tmp"
+        rm -f "$bigwig_tmp"
+        if ! bamCoverage -b "$filtered_bam" -o "$bigwig_tmp" \
+                -p "$THREADS" --binSize 10 --scaleFactor "$scale_factor" \
+                2>>"$BIGWIG_DIR/bamCoverage.log"; then
+            rm -f "$bigwig_tmp"
+            die "[$sample] bamCoverage failed (see $BIGWIG_DIR/bamCoverage.log)"
+        fi
+        mv -f "$bigwig_tmp" "$bigwig"
     fi
 }
 
@@ -304,7 +312,7 @@ run_alignment() {
         generate_bigwig "$sample" "$method" "$scale_factor"
 
         # Append one statistics row per method (FRiP is written per-tool during
-        # peak QC: 04_peaks/<tool>/consensus_<target>_frip.tab via plotEnrichment).
+        # peak QC: 05_peak/<tool>/consensus_<target>_frip.tab via plotEnrichment).
         # Sample+method dedupe: partial re-runs (e.g. a method added to the
         # config later) must not duplicate rows already recorded.
         if ! awk -F',' -v s="$sample" -v m="$method" \
@@ -792,7 +800,7 @@ run_global_qc() {
     for method in "${NORM_METHODS[@]}"; do
         ALL_BWS=()
         for sample in "${ALL_SAMPLES[@]}"; do
-            bw="$ALIGN_DIR/${sample}.${method}.bw"
+            bw="$BIGWIG_DIR/${sample}.${method}.bw"
             if [[ -s "$bw" ]]; then
                 ALL_BWS+=("$bw")
             else
@@ -813,7 +821,7 @@ run_global_qc() {
 }
 
 # Per-tool peak QC: FRiP + heatmaps over this tool's consensus peaks,
-# written directly under 04_peaks/<tool>/. The single MultiQC report is
+# written directly under 05_peak/<tool>/. The single MultiQC report is
 # generated later in Phase 4 (run_global_qc), scanning the whole OUTDIR.
 # Usage: run_peak_qc <tool>
 run_peak_qc() {
@@ -877,7 +885,7 @@ run_peak_qc() {
             read -ra target_samples <<< "${TARGET_SAMPLES[$target]}"
             local -a target_bws=()
             for sample in "${target_samples[@]}"; do
-                bw="$ALIGN_DIR/${sample}.${method}.bw"
+                bw="$BIGWIG_DIR/${sample}.${method}.bw"
                 [[ -s "$bw" ]] && target_bws+=("$bw")
             done
             [[ ${#target_bws[@]} -eq 0 ]] && continue
@@ -1014,7 +1022,8 @@ main() {
     FASTQC_DIR="$OUTDIR/01_fastqc"
     FASTP_DIR="$OUTDIR/02_fastp"
     ALIGN_DIR="$OUTDIR/03_bam"
-    PEAK_DIR="$OUTDIR/04_peaks"
+    BIGWIG_DIR="$OUTDIR/04_bigwig"
+    PEAK_DIR="$OUTDIR/05_peak"
     MULTIQC_DIR="$OUTDIR/multiqc"
 
     # Resolve the spike-free scale factor file once (consumed by norm_prereq /
@@ -1074,7 +1083,7 @@ EOF
     # Phase 2: Alignment
     log_info ""
     log_info "========== Phase 2: Alignment =========="
-    create_dirs "$ALIGN_DIR"
+    create_dirs "$ALIGN_DIR" "$BIGWIG_DIR"
     loop_over_csv "$SAMPLESHEET" run_alignment
     
     # Phase 3: Peak Calling (per selected tool)

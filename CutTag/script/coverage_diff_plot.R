@@ -19,10 +19,10 @@ samples <- crossing(c("0_","05_"), c("1","2","3")) %>%
 use_norm_method <- "CPM"
 bam_files <- str_c("03_bam/IMR", samples, ".filtered.bam") %>% 
   print()
-bw_files <- str_c("03_bam/IMR", samples, ".", use_norm_method, ".bw") %>% 
+bw_files <- str_c("04_bigwig/IMR", samples, ".", use_norm_method, ".bw") %>% 
   print()
 
-gr  <- import("04_peaks/consensus_H3K27me3.bed")
+gr  <- import("05_peak/consensus_H3K27me3.bed")
 
 
 

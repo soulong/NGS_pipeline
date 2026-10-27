@@ -25,7 +25,7 @@ bash $script_dir/run_cuttag.sh config.yml
 
 ## Outputs
 - QC reports and trimmed FASTQs
-- Aligned BAMs and peak files (BED/PEAK)
+- Aligned BAMs (`03_bam/`), normalized BigWigs (`04_bigwig/`) and peak files (`05_peak/`)
 - Normalized count tables and summary plots
 - Logs
 
@@ -38,14 +38,14 @@ bash $script_dir/run_cuttag.sh config.yml
   BigWig QC/heatmap outputs and a `statistics.csv` row (one per sample per
   method). Methods with missing prerequisites (spike-in alignment for `Spike`,
   the scale-factor file for `SpikeFree`) are skipped with a warning.
-- BigWig generation is guarded by `<file>.bw.done` markers (resume safety): a
-  BigWig is only skipped when both the marker and a non-empty BigWig exist, so
-  an interrupted `bamCoverage` never leaves a truncated BigWig behind. Delete
-  a sample's `.bw.done` to force regeneration.
+- BigWigs are written to `04_bigwig/` (no completion markers): `bamCoverage`
+  writes to a temp file that is renamed only on success and deleted on failure,
+  so a `.bw` at the final path is always complete. Delete a sample's `.bw` to
+  force regeneration.
 
 ## Heatmap options (config.yml)
 - `heatmap_binsize` (default `50`) — bp per bin for `computeMatrix`. Larger values reduce memory and runtime for big BED files: memory ≈ n_regions × n_samples × (window/binsize) × 8 bytes. 100k regions × 30 samples × 120 bins ≈ 3 GB at binSize 50.
-- `heatmap_max_regions` (default `100000`) — BED files with more regions (e.g. consensus peaks from many samples) are deterministically subsampled (fixed random source) to bound matrix size. Subsampled BED is cached in the corresponding heatmap output directory (e.g. `result/multiqc/` for global QC, `04_peaks/<tool>/` for peak QC).
+- `heatmap_max_regions` (default `100000`) — BED files with more regions (e.g. consensus peaks from many samples) are deterministically subsampled (fixed random source) to bound matrix size. Subsampled BED is cached in the corresponding heatmap output directory (e.g. `result/multiqc/` for global QC, `05_peak/<tool>/` for peak QC).
 - All samples stay in a single matrix (one row per BED region, samples side-by-side), so groups remain directly comparable in one heatmap.
 
 ## PCA (config.yml)

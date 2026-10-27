@@ -48,11 +48,11 @@ library(TxDb.Dmelanogaster.UCSC.dm6.ensGene) # fly
 # ---- config ------------------------------------------------------------------
 result_dir    <- "E:/EED/2026-07-21_CutTag_cel_fly_mm/fly/result"
 bam_dir       <- "03_bam"
-# peak_dir      <- "04_peaks/macs/peak"        # or "04_peaks/seacr/peak"
-peak_dir <- "04_peaks"
+# peak_dir      <- "05_peak/macs/peak"         # or "05_peak/seacr/peak"
+peak_dir <- "05_peak"
 peak_pattern  <- "_peaks\\.broadPeak$"       # or "_stringent\\.bed$" for seacr
-# consensus_bed <- "04_peaks/macs/consensus_H3K27me3.bed"
-consensus_bed <- "04_peaks/consensus_H3K27me3.bed"
+# consensus_bed <- "05_peak/macs/consensus_H3K27me3.bed"
+consensus_bed <- "05_peak/consensus_H3K27me3.bed"
 # txdb          <- TxDb.Celegans.UCSC.ce11.refGene
 txdb <- TxDb.Dmelanogaster.UCSC.dm6.ensGene
 
