@@ -25,13 +25,13 @@
 library(tidyverse)
 
 # ---- config ------------------------------------------------------------------
-result_dir       <- "D:\\EED_CutTag\\X101SC26064008-Z01-J011\\mice\\result\\multiqc"
-out_dir          <- dirname(result_dir)   # plots / tables go next to the multiqc folder
+result_dir       <- "E:\\EED\\2026-10-30_CutTag_Cel_H3K4_H3K27\\result\\multiqc_H3K27me3"
+out_dir          <- result_dir # dirname(result_dir)   # plots / tables go next to the multiqc folder
 fingerprint_file <- "BAM_fingerprint.txt"
 
 # sample name pattern, adjust per project (column names after clean_names):
 # sample_pattern <- c(sample = ".*", "[_]", gender=".*", "[_]", rep = "\\d+")   # e.g. d1_1
-sample_pattern <- c(sample = ".*", "[-_]", rep = "\\d+") 
+sample_pattern <- c(sample = ".*", "[-]", rep = "\\d+") 
 grouping <- setdiff(str_subset(names(sample_pattern), ".+"), "rep")
 # sample_pattern <- c(sample = ".*", "[-_]", rep = "\\d+")           # e.g. MN0_1
 

@@ -58,6 +58,7 @@ parse_yaml_config() {
             threads) THREADS="$value" ;;
             skip_preprocess) SKIP_PREPROCESS="$value" ;;
             sort_mem_limit) SORT_MEM_LIMIT="$value" ;;
+            tmp_dir) TMP_DIR_CFG="$value" ;;
             max_frag_length) MAX_FRAG_LENGTH="$value" ;;
             peak_caller) PEAK_CALLER="$value" ;;
             macs_parameter) MACS_PARAMETER="$value" ;;
@@ -919,6 +920,7 @@ main() {
     MACS_PARAMETER="${MACS_PARAMETER:-}"
     SEACR_PARAMETER="${SEACR_PARAMETER:-}"
     SORT_MEM_LIMIT="${SORT_MEM_LIMIT:-8G}"
+    TMP_DIR_CFG="${TMP_DIR_CFG:-}"
     MAX_FRAG_LENGTH="${MAX_FRAG_LENGTH:-2000}"
     THREADS="${THREADS:-8}"
 
@@ -980,6 +982,19 @@ main() {
     FASTQ_DIR="$ROOT_DIR/$FASTQ_DIR"
     SAMPLESHEET="$ROOT_DIR/$SAMPLESHEET"
     mkdir -p "$OUTDIR"
+
+    # Disk-backed scratch dir for tool temp files. sambamba sort/markdup spill
+    # chunks into $TMPDIR, which defaults to /tmp — a small RAM-backed tmpfs on
+    # many systems (WSL2: ~50% of RAM). When sorting large BAMs the tmpfs fills
+    # up and the sort dies mid-stream ("Unable to write to stream"), cascading
+    # into markdup/index/flagstat failures. Redirect TMPDIR next to the results
+    # (config key tmp_dir overrides; relative paths are ROOT_DIR-relative).
+    if [[ -n "$TMP_DIR_CFG" && "$TMP_DIR_CFG" != /* ]]; then
+        TMP_DIR_CFG="$ROOT_DIR/$TMP_DIR_CFG"
+    fi
+    TMP_DIR="${TMP_DIR_CFG:-$OUTDIR/tmp}"
+    mkdir -p "$TMP_DIR"
+    export TMPDIR="$TMP_DIR" TMP="$TMP_DIR"
 
     # Set up logging: keep a copy of the original terminal stdout (fd3), then send
     # all output to the log file; the pipeline's own [date-time]-prefixed
@@ -1064,6 +1079,7 @@ EOF
     log_info "  Species: $SPECIES"
     log_info "  Samplesheet: $SAMPLESHEET"
     log_info "  Threads: $THREADS"
+    log_info "  Temp dir (TMPDIR): $TMP_DIR"
     log_info "  Normalization: ${NORM_METHODS[*]}"
     log_info "  Peak calling: ${PEAK_CALLER:-none}"
     log_info "  Spike-in: $RUN_SPIKE"

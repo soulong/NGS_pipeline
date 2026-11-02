@@ -22,6 +22,15 @@ threads: 8
 # Memory limit for sambamba sort (e.g., "16G", "32G")
 sort_mem_limit: 16G
 
+# Scratch directory for tool temp files (sambamba sort/markdup spill their
+# sorting chunks here). Must be on a real disk with enough free space —
+# roughly the size of the largest unsorted BAM per sample (~5-6 GB for
+# ~100M read pairs). Defaults to <outdir>/tmp; relative paths are
+# root_dir-relative. Do NOT point this at /tmp on systems where /tmp is a
+# small RAM-backed tmpfs (e.g. WSL2): a full tmpfs kills the sort mid-run
+# ("Unable to write to stream") and fails the sample.
+# tmp_dir: result/tmp
+
 # Maximum fragment length for paired-end alignment
 max_frag_length: 1000
 
