@@ -59,6 +59,7 @@ parse_yaml_config() {
             skip_preprocess) SKIP_PREPROCESS="$value" ;;
             sort_mem_limit) SORT_MEM_LIMIT="$value" ;;
             tmp_dir) TMP_DIR_CFG="$value" ;;
+            scratch_dir) SCRATCH_DIR_CFG="$value" ;;
             max_frag_length) MAX_FRAG_LENGTH="$value" ;;
             peak_caller) PEAK_CALLER="$value" ;;
             macs_parameter) MACS_PARAMETER="$value" ;;
@@ -91,40 +92,154 @@ parse_yaml_config() {
 } 
 
 
+# ============================= BAM Integrity Helpers =============================
+# sambamba exits 0 even after fatal write errors ("Unable to write to
+# stream") and appends a valid BGZF EOF on its way out, so an interrupted
+# BAM can pass samtools quickcheck while missing most records or carrying
+# garbage before the end ("wrong BGZF magic" at index time). quickcheck only
+# inspects head and tail, so every BAM this pipeline produces or reuses is
+# additionally validated by a full decompression pass (every BGZF block is
+# CRC-checked) before it is trusted.
+
+bam_valid() {
+    # Fully validate a BAM file: non-empty, quickcheck-clean, and decodable
+    # end to end. Usage: bam_valid <bam>
+    local bam="$1"
+    [[ -s "$bam" ]] || return 1
+    samtools quickcheck -q "$bam" 2>/dev/null || return 1
+    samtools view -c "$bam" > /dev/null 2>&1 || return 1
+    return 0
+}
+
+install_bam() {
+    # Copy a validated scratch BAM (and its .bai, when present) into the
+    # results directory and verify the copy arrived intact: byte-for-byte
+    # size match plus quickcheck. A full re-read is skipped on purpose — cp
+    # already transferred every byte; truncation shows up as a size mismatch
+    # or missing EOF. The destination only ever appears under its final name
+    # once complete, so a crash mid-copy cannot leave a half-written BAM at
+    # the path the resume logic trusts. Usage: install_bam <src> <dst>
+    local src="$1" dst="$2"
+    rm -f "${dst}.installing" "${dst}.installing.bai"
+    cp -f "$src" "${dst}.installing" || return 1
+    if [[ -s "${src}.bai" ]]; then
+        cp -f "${src}.bai" "${dst}.installing.bai" || return 1
+    fi
+    [[ "$(stat -c '%s' "$src")" == "$(stat -c '%s' "${dst}.installing")" ]] || return 1
+    samtools quickcheck -q "${dst}.installing" 2>/dev/null || return 1
+    mv -f "${dst}.installing" "$dst" || return 1
+    if [[ -s "${dst}.installing.bai" ]]; then
+        mv -f "${dst}.installing.bai" "${dst}.bai" || return 1
+    fi
+    return 0
+}
+
+
 # ============================= Sample Processing Functions =============================
 bowtie2_alignment() {
     local sample="$1"
     local clean1="$FASTP_DIR/${sample}_R1.fq.gz"
     local clean2="$FASTP_DIR/${sample}_R2.fq.gz"
-    
+
     local sorted_bam="$ALIGN_DIR/${sample}.sorted.bam"
     local markdup_bam="$ALIGN_DIR/${sample}.markdup.bam"
     local flagstat_file="$ALIGN_DIR/${sample}.markdup.flagstat"
-    
-    if [[ -s "$markdup_bam" && -s "${markdup_bam}.bai" && ! -s "$flagstat_file" ]]; then
-        log_info "[$sample] Regenerating missing flagstat"
-        sambamba flagstat -t "$THREADS" "$markdup_bam" > "$flagstat_file" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
+
+    # Heavy intermediates are written to the scratch filesystem and only
+    # installed into ALIGN_DIR once fully validated (see scratch_dir in main)
+    local workdir="$SCRATCH_DIR/${sample}"
+    local w_sorted="$workdir/${sample}.sorted.bam"
+    local w_markdup="$workdir/${sample}.markdup.bam"
+
+    # A flagstat with plausible content proves a prior run finished this
+    # sample (flagstat streams the whole BAM, so its existence implies the
+    # BAM was fully readable at generation time) — reuse without re-reading
+    if [[ -s "$markdup_bam" && -s "${markdup_bam}.bai" && -s "$flagstat_file" ]] \
+        && grep -q "in total" "$flagstat_file"; then
+        :
+    elif [[ -s "$markdup_bam" && -s "${markdup_bam}.bai" ]]; then
+        # BAM present but flagstat missing/empty: a previous run died
+        # mid-sample. Because sambamba exits 0 on write errors, the BAM may
+        # be quietly corrupt — a full-record check decides between
+        # regenerating the flagstat and redoing the sample
+        log_info "[$sample] Verifying existing markdup BAM (flagstat missing)"
+        if bam_valid "$markdup_bam"; then
+            log_info "[$sample] BAM intact — regenerating flagstat"
+            sambamba flagstat -t "$THREADS" "$markdup_bam" > "$flagstat_file" \
+                2>>"$ALIGN_DIR/${sample}.sambamba.log" || true
+        else
+            log_warn "[$sample] Existing markdup BAM is corrupt — redoing alignment"
+            rm -f "$markdup_bam" "${markdup_bam}.bai" "$flagstat_file"
+        fi
     fi
 
-    if [[ ! -s "$markdup_bam" || ! -s "${markdup_bam}.bai" ]]; then
+    if [[ ! -s "$flagstat_file" || ! -s "${markdup_bam}.bai" ]] \
+        || ! grep -q "in total" "$flagstat_file"; then
         log_info "[$sample] Aligning to genome"
-        # (stderr of each tool goes to a per-sample log instead of /dev/null so
-        # failures leave a trace; command substitution at the call site would
-        # otherwise swallow the non-zero exit of this function)
-        bowtie2 -x "$BOWTIE2_INDEX" -1 "$clean1" -2 "$clean2" -p "$THREADS" --phred33 \
-            --very-sensitive --local --no-mixed --no-discordant -I 10 -X "$MAX_FRAG_LENGTH" \
-            --rg-id "$sample" --rg "SM:${sample}\tPL:ILLUMINA" \
-            2>"$ALIGN_DIR/${sample}.bowtie2.log" \
-            | sambamba view -t "$THREADS" -S -f bam /dev/stdin 2>>"$ALIGN_DIR/${sample}.sambamba.log" \
-            | sambamba sort -t "$THREADS" -m "$SORT_MEM_LIMIT" -o "$sorted_bam" /dev/stdin 2>>"$ALIGN_DIR/${sample}.sambamba.log"
+        rm -rf "$workdir"
+        mkdir -p "$workdir"
+        # Retry up to 3 times: sambamba dies silently on flaky filesystem
+        # writes (9P /mnt/* mounts under WSL2), leaving unusable output.
+        # A valid sorted BAM survives between attempts, so a markdup failure
+        # only redoes the markdup stage, not the alignment.
+        local attempt=1
+        while :; do
+            if [[ $attempt -gt 3 ]]; then
+                die "[$sample] genome alignment failed after 3 attempts (see $ALIGN_DIR/${sample}.sambamba.log)"
+            fi
+            [[ $attempt -gt 1 ]] && log_warn "[$sample] alignment attempt $attempt/3"
 
-        log_info "[$sample] Marking duplicates"
-        sambamba markdup -t "$THREADS" "$sorted_bam" "$markdup_bam" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
-        sambamba index -t "$THREADS" "$markdup_bam" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
-        sambamba flagstat "$markdup_bam" > "$flagstat_file" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
-        if [[ -s "$flagstat_file" ]]; then
-            rm -f "$sorted_bam" "${sorted_bam}.bai"
-        fi
+            # Stage 1: sort
+            if ! bam_valid "$w_sorted"; then
+                rm -f "$w_sorted" "$w_sorted.bai"
+                if bam_valid "$sorted_bam"; then
+                    # Valid sorted BAM left in the results dir by an older
+                    # pipeline version or an interrupted run — reuse it
+                    log_info "[$sample] Reusing valid sorted BAM from a previous run"
+                    mv -f "$sorted_bam" "$w_sorted" || true
+                    rm -f "${sorted_bam}.bai"
+                else
+                    rm -f "$sorted_bam" "${sorted_bam}.bai"
+                    # (stderr of each tool goes to a per-sample log instead of
+                    # /dev/null so failures leave a trace; command substitution
+                    # at the call site would otherwise swallow the non-zero
+                    # exit of this function)
+                    if ! bowtie2 -x "$BOWTIE2_INDEX" -1 "$clean1" -2 "$clean2" -p "$THREADS" --phred33 \
+                        --very-sensitive --local --no-mixed --no-discordant -I 10 -X "$MAX_FRAG_LENGTH" \
+                        --rg-id "$sample" --rg "SM:${sample}\tPL:ILLUMINA" \
+                        2>"$ALIGN_DIR/${sample}.bowtie2.log" \
+                        | sambamba view -t "$THREADS" -S -f bam /dev/stdin 2>>"$ALIGN_DIR/${sample}.sambamba.log" \
+                        | sambamba sort -t "$THREADS" -m "$SORT_MEM_LIMIT" -o "$w_sorted" /dev/stdin \
+                            2>>"$ALIGN_DIR/${sample}.sambamba.log"; then
+                        log_warn "[$sample] sort pipeline exited non-zero (attempt $attempt)"
+                    fi
+                fi
+                if ! bam_valid "$w_sorted"; then
+                    log_warn "[$sample] sort attempt $attempt did not produce a valid BAM"
+                    attempt=$((attempt + 1))
+                    continue
+                fi
+            fi
+
+            # Stage 2: markdup + index + flagstat (all inside scratch)
+            log_info "[$sample] Marking duplicates"
+            sambamba markdup -t "$THREADS" "$w_sorted" "$w_markdup" \
+                2>>"$ALIGN_DIR/${sample}.sambamba.log" || true
+            sambamba index -t "$THREADS" "$w_markdup" \
+                2>>"$ALIGN_DIR/${sample}.sambamba.log" || true
+            sambamba flagstat -t "$THREADS" "$w_markdup" > "$flagstat_file" \
+                2>>"$ALIGN_DIR/${sample}.sambamba.log" || true
+
+            if bam_valid "$w_markdup" && [[ -s "$w_markdup.bai" ]] \
+                && grep -q "in total" "$flagstat_file" \
+                && install_bam "$w_markdup" "$markdup_bam"; then
+                rm -rf "$workdir"
+                break
+            fi
+            log_warn "[$sample] markdup attempt $attempt did not produce a valid BAM"
+            rm -f "$w_markdup" "$w_markdup.bai"
+            attempt=$((attempt + 1))
+        done
     fi
 
     # Extract statistics (hard-fail: a missing/unreadable flagstat must not
@@ -144,24 +259,46 @@ bowtie2_alignment_spike() {
     local sample="$1"
     local clean1="$FASTP_DIR/${sample}_R1.fq.gz"
     local clean2="$FASTP_DIR/${sample}_R2.fq.gz"
-    
+
     local spike_sorted_bam="$ALIGN_DIR/${sample}.spike.sorted.bam"
     local spike_flagstat="$ALIGN_DIR/${sample}.spike.sorted.flagstat"
-    
-    if [[ ! -s "$spike_flagstat" ]]; then
-        log_info "[$sample] Aligning to spike-in genome"
-        bowtie2 -x "$SPIKE_INDEX" -1 "$clean1" -2 "$clean2" -p "$THREADS" --phred33 \
-            --very-sensitive --local --no-mixed --no-discordant -I 10 -X "$MAX_FRAG_LENGTH" \
-            --rg-id "$sample" --rg "SM:${sample}\tPL:ILLUMINA" \
-            2>"$ALIGN_DIR/${sample}.spike.bowtie2.log" \
-            | sambamba view -t "$THREADS" -S -f bam /dev/stdin 2>>"$ALIGN_DIR/${sample}.sambamba.log" \
-            | sambamba sort -t "$THREADS" -m "$SORT_MEM_LIMIT" \
-                -o "$spike_sorted_bam" /dev/stdin 2>>"$ALIGN_DIR/${sample}.sambamba.log"
 
-        sambamba flagstat "$spike_sorted_bam" > "$spike_flagstat" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
-        if [[ -s "$spike_flagstat" ]]; then
-            rm -f "$spike_sorted_bam" "${spike_sorted_bam}.bai"
-        fi
+    if [[ ! -s "$spike_flagstat" ]] || ! grep -q "in total" "$spike_flagstat"; then
+        log_info "[$sample] Aligning to spike-in genome"
+        local workdir="$SCRATCH_DIR/${sample}.spike"
+        local w_spike="$workdir/${sample}.spike.sorted.bam"
+        rm -rf "$workdir"
+        mkdir -p "$workdir"
+        local attempt=1
+        while :; do
+            if [[ $attempt -gt 3 ]]; then
+                die "[$sample] spike-in alignment failed after 3 attempts (see $ALIGN_DIR/${sample}.sambamba.log)"
+            fi
+            [[ $attempt -gt 1 ]] && log_warn "[$sample] spike-in alignment attempt $attempt/3"
+
+            if ! bowtie2 -x "$SPIKE_INDEX" -1 "$clean1" -2 "$clean2" -p "$THREADS" --phred33 \
+                --very-sensitive --local --no-mixed --no-discordant -I 10 -X "$MAX_FRAG_LENGTH" \
+                --rg-id "$sample" --rg "SM:${sample}\tPL:ILLUMINA" \
+                2>"$ALIGN_DIR/${sample}.spike.bowtie2.log" \
+                | sambamba view -t "$THREADS" -S -f bam /dev/stdin 2>>"$ALIGN_DIR/${sample}.sambamba.log" \
+                | sambamba sort -t "$THREADS" -m "$SORT_MEM_LIMIT" \
+                    -o "$w_spike" /dev/stdin 2>>"$ALIGN_DIR/${sample}.sambamba.log"; then
+                log_warn "[$sample] spike-in sort pipeline exited non-zero (attempt $attempt)"
+            fi
+
+            sambamba flagstat -t "$THREADS" "$w_spike" > "$workdir/spike.flagstat" \
+                2>>"$ALIGN_DIR/${sample}.sambamba.log" || true
+
+            if bam_valid "$w_spike" && grep -q "in total" "$workdir/spike.flagstat" \
+                && cp -f "$workdir/spike.flagstat" "$spike_flagstat"; then
+                rm -rf "$workdir"
+                rm -f "$spike_sorted_bam" "${spike_sorted_bam}.bai"
+                break
+            fi
+            log_warn "[$sample] spike-in attempt $attempt did not produce a valid result"
+            rm -f "$w_spike" "$w_spike.bai"
+            attempt=$((attempt + 1))
+        done
     fi
 
     local spike_reads
@@ -177,8 +314,10 @@ bam_filter() {
     local flagstat_filtered="$ALIGN_DIR/${sample}.filtered.flagstat"
 
     # Rerun when either the BAM or its flagstat is missing (both are needed:
-    # the flagstat alone cannot regenerate a filtered BAM that was cleaned up)
-    if [[ ! -s "$filtered_bam" || ! -s "$flagstat_filtered" ]]; then
+    # the flagstat alone cannot regenerate a filtered BAM that was cleaned up),
+    # or when the existing BAM fails quickcheck (truncated leftover)
+    if [[ ! -s "$filtered_bam" || ! -s "$flagstat_filtered" ]] \
+        || ! samtools quickcheck -q "$filtered_bam" 2>/dev/null; then
         local chr_filter
         case "$SPECIES" in
             chm13|hs|mm)
@@ -196,11 +335,30 @@ bam_filter() {
             exit 1
         fi
         log_info "[$sample] Filtering BAM (MAPQ≥30, proper pairs, main chromosomes)"
-        samtools view -@ "$THREADS" -b -f 2 -q 30 -F 3852 \
+        # Filter into scratch and install only after validation (flaky
+        # filesystem writes must not leave a corrupt BAM in the results dir)
+        local workdir="$SCRATCH_DIR/${sample}.filter"
+        local w_filtered="$workdir/${sample}.filtered.bam"
+        rm -rf "$workdir"
+        mkdir -p "$workdir"
+        if ! samtools view -@ "$THREADS" -b -f 2 -q 30 -F 3852 \
             -e "$chr_filter" \
-            -o "$filtered_bam" "$markdup_bam"
-        sambamba index -t "$THREADS" "$filtered_bam" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
-        sambamba flagstat -t "$THREADS" "$filtered_bam" > "$flagstat_filtered" 2>>"$ALIGN_DIR/${sample}.sambamba.log"
+            -o "$w_filtered" "$markdup_bam"; then
+            log_warn "[$sample] samtools view exited non-zero during filtering"
+        fi
+        if bam_valid "$w_filtered" && install_bam "$w_filtered" "$filtered_bam"; then
+            rm -rf "$workdir"
+        else
+            rm -rf "$workdir"
+            die "[$sample] BAM filtering did not produce a valid output"
+        fi
+        sambamba index -t "$THREADS" "$filtered_bam" \
+            2>>"$ALIGN_DIR/${sample}.sambamba.log" || true
+        sambamba flagstat -t "$THREADS" "$filtered_bam" > "$flagstat_filtered" \
+            2>>"$ALIGN_DIR/${sample}.sambamba.log" || true
+        if [[ ! -s "$flagstat_filtered" ]] || ! grep -q "in total" "$flagstat_filtered"; then
+            die "[$sample] filtered flagstat is missing or unreadable: $flagstat_filtered"
+        fi
     fi
 
     local filtered_reads
@@ -921,6 +1079,7 @@ main() {
     SEACR_PARAMETER="${SEACR_PARAMETER:-}"
     SORT_MEM_LIMIT="${SORT_MEM_LIMIT:-8G}"
     TMP_DIR_CFG="${TMP_DIR_CFG:-}"
+    SCRATCH_DIR_CFG="${SCRATCH_DIR_CFG:-}"
     MAX_FRAG_LENGTH="${MAX_FRAG_LENGTH:-2000}"
     THREADS="${THREADS:-8}"
 
@@ -995,6 +1154,32 @@ main() {
     TMP_DIR="${TMP_DIR_CFG:-$OUTDIR/tmp}"
     mkdir -p "$TMP_DIR"
     export TMPDIR="$TMP_DIR" TMP="$TMP_DIR"
+
+    # Scratch filesystem for multi-GB alignment intermediates (sorted /
+    # markdup BAMs). Under WSL2 the /mnt/* Windows mounts are 9P filesystems
+    # where large streamed writes intermittently fail — and sambamba exits 0
+    # on those errors, so a sort/markdup can quietly produce a corrupt BAM.
+    # Writing intermediates on the Linux-native filesystem avoids that;
+    # finished BAMs are validated and copied into the results dir afterwards
+    # (see bam_valid / install_bam). "auto" picks the native
+    # HOME filesystem when running under WSL with plenty of free space,
+    # falling back to TMP_DIR elsewhere. Config key scratch_dir overrides.
+    if [[ -n "$SCRATCH_DIR_CFG" ]]; then
+        SCRATCH_DIR="$SCRATCH_DIR_CFG"
+        [[ "$SCRATCH_DIR" != /* ]] && SCRATCH_DIR="$ROOT_DIR/$SCRATCH_DIR"
+    elif grep -qi microsoft /proc/version 2>/dev/null; then
+        local avail_kb
+        avail_kb=$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+        if [[ "${avail_kb:-0}" -ge $((100 * 1024 * 1024)) ]]; then
+            SCRATCH_DIR="$HOME/.cache/cuttag_scratch"
+        else
+            log_warn "Less than 100G free on the \$HOME filesystem — using $TMP_DIR for alignment scratch"
+            SCRATCH_DIR="$TMP_DIR"
+        fi
+    else
+        SCRATCH_DIR="$TMP_DIR"
+    fi
+    mkdir -p "$SCRATCH_DIR"
 
     # Set up logging: keep a copy of the original terminal stdout (fd3), then send
     # all output to the log file; the pipeline's own [date-time]-prefixed
@@ -1080,6 +1265,7 @@ EOF
     log_info "  Samplesheet: $SAMPLESHEET"
     log_info "  Threads: $THREADS"
     log_info "  Temp dir (TMPDIR): $TMP_DIR"
+    log_info "  Scratch dir (alignment): $SCRATCH_DIR"
     log_info "  Normalization: ${NORM_METHODS[*]}"
     log_info "  Peak calling: ${PEAK_CALLER:-none}"
     log_info "  Spike-in: $RUN_SPIKE"

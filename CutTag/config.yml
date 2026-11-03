@@ -31,6 +31,16 @@ sort_mem_limit: 16G
 # ("Unable to write to stream") and fails the sample.
 # tmp_dir: result/tmp
 
+# Scratch filesystem for multi-GB alignment intermediates (sorted/markdup
+# BAMs). sambamba can silently exit 0 after a failed write, leaving corrupt
+# output — on WSL2 this happens on the /mnt/* 9P mounts under load.
+# "auto" (default): under WSL, intermediates are written to a native Linux
+# path (~/.cache/cuttag_scratch, requires >=100G free) and copied into the
+# results dir after full validation; on native Linux, result/tmp is used.
+# Override with an explicit path (>= ~2x your largest input fastq in free
+# space; relative paths are root_dir-relative):
+# scratch_dir: auto
+
 # Maximum fragment length for paired-end alignment
 max_frag_length: 1000
 
